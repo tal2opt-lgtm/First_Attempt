@@ -1,0 +1,994 @@
+import socket
+import struct
+import threading
+import time
+import queue
+from collections import deque
+import numpy as np
+import json
+import os
+from PIL import Image, ImageDraw, ImageFont
+import re
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from pathlib import Path
+
+def _load_icon_png(rel_path: str, size_px: int):
+
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(base, rel_path)
+        if not os.path.isfile(p):
+            return None
+        ico = Image.open(p).convert("RGBA")
+        if size_px and size_px > 0:
+            ico = ico.resize((size_px, size_px), Image.LANCZOS)
+        return ico
+    except Exception:
+        return None
+
+# =========================
+# Fonts (single, simple, cached)
+# =========================
+_FONT_CACHE = {}
+
+def get_fonts():
+    """Single source of truth for PIL fonts used by this module."""
+    key = "v1"
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+
+    win_dir = os.environ.get("WINDIR", r"C:\Windows")
+    win_fonts = os.path.join(win_dir, "Fonts")
+
+    def ttf(fname: str, size: int):
+        try:
+            return ImageFont.truetype(os.path.join(win_fonts, fname), size=size)
+        except Exception:
+            return ImageFont.load_default()
+
+    fonts = {
+        "label":  ttf("arial.ttf", 12),
+        "value":  ttf("arial.ttf", 14),
+        "status": ttf("arial.ttf", 18),
+        "symbol": ttf("seguisym.ttf", 20),
+        "emoji":  ttf("seguiemj.ttf", 18),
+    }
+
+    _FONT_CACHE[key] = fonts
+    return fonts
+
+
+# -------------------------
+# RTL text helpers (Hebrew)
+# -------------------------
+_HEB_RE = re.compile(r"[\u0590-\u05FF]")
+_NUM_RE = re.compile(r"[-+]?(?:\d+(?:\.\d+)?)")
+_LAT_RE = re.compile(r"[A-Za-z]+")
+
+
+def _rtl_visual(text: str) -> str:
+
+    if text is None:
+        return ""
+    s = str(text)
+    if not _HEB_RE.search(s):
+        return s
+
+    # Reverse full string
+    rs = s[::-1]
+
+    # Swap bracket directions after reversal
+    swap = str.maketrans({
+        "(": ")", ")": "(",
+        "[": "]", "]": "[",
+        "{": "}", "}": "{",
+        "<": ">", ">": "<",
+    })
+    rs = rs.translate(swap)
+
+    # Reverse digit sequences back
+    def _rev(m):
+        return m.group(0)[::-1]
+
+    rs = _NUM_RE.sub(_rev, rs)
+
+    # Reverse latin runs back (e.g. mm, Time, PLC)
+    rs = _LAT_RE.sub(_rev, rs)
+    return rs
+
+# =========================
+# JSON Machine Config
+# =========================
+
+
+# =========================
+# Helpers: parse PUSH packet
+# =========================
+def parse_push_packet(data: bytes):
+    if len(data) < 18:
+        return None
+    payload = data[14:]
+    if len(payload) < 4 or (len(payload) % 4) != 0:
+        return None
+    total_vals = len(payload) // 4
+    vals_nm = struct.unpack(">" + "i" * total_vals, payload)
+    return [v / 1_000_000.0 for v in vals_nm]  # mm
+
+# =========================
+# Config + Runtime State
+# =========================
+class ThicknessConfig(object):
+    """Fixed parameters loaded from JSON (no in-code defaults)."""
+    def __init__(self ):
+        self._config_path = str(Path(__file__).parent / "config" / "config457_thk.json")
+        self._load_from_dict(self._load_json())
+
+    def _load_json(self):
+        if not os.path.isfile(self._config_path):
+            raise FileNotFoundError(f"Config JSON not found: {self._config_path}")
+        with open(self._config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_from_dict(self, d):
+        required = (
+            "sensors", "socket_timeout_sec", "frame_interval_sec", "time_sync_threshold_sec",
+            "live_update_hz", "reference_height_mm", "sensor_distance_mm", "error_threshold_mm",
+            "axial_span_mm", "thickness_min_mm", "thickness_max_mm", "max_error_count",
+            "target_points", "trim_lo", "trim_hi", "p2p_thresh_um",
+            "nominal_thickness_mm_default", "tol_um_default",
+        )
+        for key in required:
+            if key not in d:
+                raise KeyError(f"Missing required config key: {key}")
+
+        self.SENSORS = d["sensors"]
+        self.SOCKET_TIMEOUT = d["socket_timeout_sec"]
+        self.FRAME_INTERVAL_SEC = d["frame_interval_sec"]
+        self.TIME_SYNC_THRESHOLD = d["time_sync_threshold_sec"]
+        self.LIVE_UPDATE_HZ = d["live_update_hz"]
+
+        self.REFERENCE_HEIGHT_MM = d["reference_height_mm"]
+        self.SENSOR_DISTANCE_MM = d["sensor_distance_mm"]
+        self.ERROR_THRESHOLD_MM = d["error_threshold_mm"]
+        self.AXIAL_SPAN_MM = d["axial_span_mm"]
+
+        self.THICKNESS_MIN = d["thickness_min_mm"]
+        self.THICKNESS_MAX = d["thickness_max_mm"]
+        self.MAX_ERROR_COUNT = d["max_error_count"]
+
+        self.TARGET_POINTS = d["target_points"]
+        self.TRIM_LO = d["trim_lo"]
+        self.TRIM_HI = d["trim_hi"]
+        self.P2P_THRESH_UM = d["p2p_thresh_um"]
+
+        self.CONICITY_THRESH_UM = d.get("conicity_thresh_um", 5.0)
+
+        self.NOMINAL_THICKNESS_MM_DEFAULT = d["nominal_thickness_mm_default"]
+        self.TOL_UM_DEFAULT = d["tol_um_default"]
+
+    def load(self):
+        """Reload config from the same path used in __init__."""
+        self._load_from_dict(self._load_json())
+
+    def save(self):
+        """Save config to JSON file (indented)."""
+        d = {
+            "schema_version": "1.0",
+            "sensors": self.SENSORS,
+            "socket_timeout_sec": self.SOCKET_TIMEOUT,
+            "frame_interval_sec": self.FRAME_INTERVAL_SEC,
+            "time_sync_threshold_sec": self.TIME_SYNC_THRESHOLD,
+            "live_update_hz": self.LIVE_UPDATE_HZ,
+            "reference_height_mm": self.REFERENCE_HEIGHT_MM,
+            "sensor_distance_mm": self.SENSOR_DISTANCE_MM,
+            "error_threshold_mm": self.ERROR_THRESHOLD_MM,
+            "axial_span_mm": self.AXIAL_SPAN_MM,
+            "thickness_min_mm": self.THICKNESS_MIN,
+            "thickness_max_mm": self.THICKNESS_MAX,
+            "max_error_count": self.MAX_ERROR_COUNT,
+            "target_points": self.TARGET_POINTS,
+            "trim_lo": self.TRIM_LO,
+            "trim_hi": self.TRIM_HI,
+            "p2p_thresh_um": self.P2P_THRESH_UM,
+            "conicity_thresh_um": self.CONICITY_THRESH_UM,
+            "nominal_thickness_mm_default": self.NOMINAL_THICKNESS_MM_DEFAULT,
+            "tol_um_default": self.TOL_UM_DEFAULT,
+        }
+        with open(self._config_path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+
+Cfg = ThicknessConfig()
+
+class ThicknessRuntimeState(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+        self.samples = {"TOP": deque(maxlen=10000), "BOTTOM": deque(maxlen=10000)}
+        self.last_ts = {"TOP": 0.0, "BOTTOM": 0.0}
+
+        self.object_in_measurement = False
+        self.valid_measurement_detected = False
+        self.start_time = None
+        self.sample_count = 0
+        self.error_count = 0
+
+        self.timestamps_list = []
+        self.thickness_values = []
+
+        self.passes = []
+        self.ui_queue = queue.Queue(maxsize=50)
+
+        # Operator-history: last N part mean errors (signed) for bell-curve/gauge.
+        self.err_hist_um = deque(maxlen=60)
+
+        self.nominal_lock = threading.Lock()
+        self.nominal_thickness_mm = float(Cfg.NOMINAL_THICKNESS_MM_DEFAULT)
+        self.tol_um = float(Cfg.TOL_UM_DEFAULT)
+
+        self._last_live_push = 0.0
+
+    def reset_pass(self):
+        self.object_in_measurement = False
+        self.valid_measurement_detected = False
+        self.start_time = None
+        self.sample_count = 0
+        self.error_count = 0
+        self.timestamps_list.clear()
+        self.thickness_values.clear()
+
+    def snapshot_nominal_tol(self):
+        with self.nominal_lock:
+            return float(self.nominal_thickness_mm), float(self.tol_um)
+
+def setup_socket(port: int, timeout_sec: float):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", port))
+    s.settimeout(timeout_sec)
+    return s
+
+class SensorReader(object):
+    def __init__(self, state: ThicknessRuntimeState, name: str, port: int):
+        self.state = state
+        self.name = name
+        self.port = int(port)
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def join(self, timeout=None):
+        self.thread.join(timeout=timeout)
+
+    def run(self):
+        sock = setup_socket(self.port, Cfg.SOCKET_TIMEOUT)
+        while not self.state.stop_event.is_set():
+            while True:
+                try:
+                    data, _ = sock.recvfrom(4096)
+                    vals_mm = parse_push_packet(data)
+                    if not vals_mm:
+                        continue
+                    num = len(vals_mm)
+                    if num <= 0:
+                        continue
+
+                    # --- Time tagging (burst-robust) ---
+                    # Do NOT use time.time() as the packet timestamp (it causes "time clumping" under CPU load).
+                    # Instead, advance a per-sensor virtual clock by the configured frame interval.
+                    interval = float(Cfg.FRAME_INTERVAL_SEC)
+                    dt = interval / num
+
+                    with self.state.lock:
+                        last = self.state.last_ts[self.name]
+                        if last <= 0.0:
+                            # Anchor once to host time, then keep advancing deterministically.
+                            last = time.time() - interval
+                        for v_mm in vals_mm:
+                            last += dt
+                            abs_mm = Cfg.REFERENCE_HEIGHT_MM + v_mm
+                            self.state.samples[self.name].append((last, abs_mm))
+                        self.state.last_ts[self.name] = last
+                except socket.timeout:
+                    break
+            time.sleep(0.0005)
+
+class ThicknessProcessor(object):
+    def __init__(self, state: ThicknessRuntimeState, get_job_limits=None):
+        self.state = state
+        self.get_job_limits = get_job_limits  # optional callable () -> (min_mm, max_mm) | (None, None); used when running under T3
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def join(self, timeout=None):
+        self.thread.join(timeout=timeout)
+
+    def run(self):
+        while not self.state.stop_event.is_set():
+            t_samp = b_samp = None
+
+            with self.state.lock:
+                if self.state.samples["TOP"] and self.state.samples["BOTTOM"]:
+                    t_t, _ = self.state.samples["TOP"][0]
+                    b_t, _ = self.state.samples["BOTTOM"][0]
+                    dt = abs(t_t - b_t)
+
+                    if dt <= Cfg.TIME_SYNC_THRESHOLD:
+                        t_samp = self.state.samples["TOP"].popleft()
+                        b_samp = self.state.samples["BOTTOM"].popleft()
+                    else:
+                        if t_t < b_t:
+                            self.state.samples["TOP"].popleft()
+                        else:
+                            self.state.samples["BOTTOM"].popleft()
+
+            if t_samp is None or b_samp is None:
+                time.sleep(0.0005)
+                continue
+
+            t_time, top_abs_mm = t_samp
+            b_time, bot_abs_mm = b_samp
+
+            # Unified error / valid logic: ANY sample whose computed thickness falls
+            # outside [THICKNESS_MIN, THICKNESS_MAX] counts as an "error" sample.
+            # This handles both end-of-part (sensors empty -> thickness out of range)
+            # AND short surface features like holes/grooves whose thickness reading is
+            # off the bulk surface. Short error runs (< MAX_ERROR_COUNT) reset on the
+            # next in-range sample, so a feature is silently skipped and the pass
+            # continues with only the bulk-surface samples in the average.
+            thickness = Cfg.SENSOR_DISTANCE_MM - (top_abs_mm + bot_abs_mm)
+
+            min_mm, max_mm = self._effective_min_max_mm()
+            if min_mm <= thickness <= max_mm:
+                self.state.error_count = 0
+                t_pair = (t_time + b_time) / 2.0
+                if not self.state.object_in_measurement:
+                    self.state.object_in_measurement = True
+                    self.state.valid_measurement_detected = True
+                    self.state.start_time = t_pair
+
+                self.state.sample_count += 1
+                t_rel = t_pair - self.state.start_time
+                self.state.timestamps_list.append(t_rel)
+                self.state.thickness_values.append(thickness)
+
+                now = time.time()
+                if now - self.state._last_live_push >= 1.0 / max(1.0, float(Cfg.LIVE_UPDATE_HZ)):
+                    self.state._last_live_push = now
+                    nominal_used, _ = self.state.snapshot_nominal_tol()
+                    err_um = (thickness - nominal_used) * 1000.0
+                    try:
+                        self.state.ui_queue.put_nowait({"type": "live", "thickness_mm": thickness, "err_um": err_um})
+                    except queue.Full:
+                        pass
+            else:
+                # Out of range: empty sensors OR sample inside a hole/groove.
+                # Treated identically — count toward end-of-part. Short runs reset
+                # automatically when the next valid (in-range) sample arrives.
+                self.state.error_count += 1
+                if self.state.object_in_measurement and self.state.error_count >= Cfg.MAX_ERROR_COUNT:
+                    self.process_end_of_measurement()
+
+    def process_end_of_measurement(self):
+        nominal_used, tol_used_um = self.state.snapshot_nominal_tol()
+
+        if self.state.valid_measurement_detected and self.state.sample_count > 0 and self.state.start_time is not None:
+            t = self.state.timestamps_list
+            y = self.state.thickness_values
+            m = len(t)
+            i_lo = int(m * Cfg.TRIM_LO)
+            i_hi = int(m * Cfg.TRIM_HI)
+
+            if i_hi - i_lo >= 2:
+                t_trim = t[i_lo:i_hi]
+                y_trim = y[i_lo:i_hi]
+            else:
+                t_trim, y_trim = t[:], y[:]
+
+            raw_t = t_trim[:]
+            raw_y = y_trim[:]
+
+            raw_trim_count = len(raw_t)
+            if raw_trim_count >= 2:
+                raw_trim_duration = max(1e-9, raw_t[-1] - raw_t[0])
+                raw_trim_rate_hz = raw_trim_count / raw_trim_duration
+            else:
+                raw_trim_rate_hz = 0.0
+
+            if len(t_trim) > Cfg.TARGET_POINTS:
+                avg_t, avg_y = [], []
+                n = len(t_trim)
+                for i in range(Cfg.TARGET_POINTS):
+                    s = (i * n) // Cfg.TARGET_POINTS
+                    e = ((i + 1) * n) // Cfg.TARGET_POINTS
+                    if e <= s:
+                        continue
+                    seg_t = t_trim[s:e]
+                    seg_y = y_trim[s:e]
+                    avg_t.append(sum(seg_t) / len(seg_t))
+                    avg_y.append(sum(seg_y) / len(seg_y))
+            else:
+                avg_t, avg_y = t_trim[:], y_trim[:]
+
+            mean_thickness = float(np.mean(np.array(y_trim, float))) if len(y_trim) else None
+            mean_err_um = (mean_thickness - nominal_used) * 1000.0 if mean_thickness is not None else None
+
+            p2p_um = None
+            if len(avg_y) >= 2:
+                arr_um = (np.array(avg_y, float) - nominal_used) * 1000.0
+                p2p_um = float(np.max(arr_um) - np.min(arr_um))
+
+            conicity_um = None
+            conicity_signed_um = None
+            conicity_delta_mm = None
+            conicity_span_mm = None
+            # Conicity (operator definition):
+            #   mean of first 3 averaged points minus mean of last 3 averaged points (signed)
+            #   sign: (last_mean - first_mean) in µm
+            if len(avg_y) >= 6:
+                first_mean_mm = float(np.mean(np.array(avg_y[:3], float)))
+                last_mean_mm  = float(np.mean(np.array(avg_y[-3:], float)))
+                conicity_delta_mm = float(last_mean_mm - first_mean_mm)
+                conicity_signed_um = conicity_delta_mm * 1000.0
+                conicity_um = abs(conicity_signed_um)
+                conicity_span_mm = float(Cfg.AXIAL_SPAN_MM)
+
+            ok_nominal = (abs(mean_err_um) <= tol_used_um) if mean_err_um is not None else False
+            ok_p2p = (p2p_um is not None and p2p_um <= Cfg.P2P_THRESH_UM)
+
+            # Conicity OK if within threshold (or if conicity couldn't be computed for this pass)
+            if conicity_signed_um is None:
+                ok_conicity = True
+            else:
+                ok_conicity = (abs(conicity_signed_um) <= Cfg.CONICITY_THRESH_UM)
+
+            status = "תקין" if (ok_nominal and ok_conicity) else "פסול"
+            overall_ok = (status == "תקין")
+
+            fail_reason = None
+            if not overall_ok:
+                if mean_err_um is not None and tol_used_um is not None and abs(mean_err_um) > tol_used_um:
+                    fail_reason = "גבוה מהנומינלי" if mean_err_um > 0 else "נמוך מהנומינלי"
+                elif conicity_signed_um is not None and abs(conicity_signed_um) > float(Cfg.CONICITY_THRESH_UM):
+                    fail_reason = "קוניות גבוהה"
+                else:
+                    fail_reason = None
+
+            p = {
+                "raw_t": raw_t, "raw_y": raw_y,
+                "avg_t": avg_t, "avg_y": avg_y,
+                "nominal_used": nominal_used,
+                "tol_used_um": tol_used_um,
+                "conicity_signed_um": (float(conicity_signed_um) if conicity_signed_um is not None else None),
+                "mean_thickness": mean_thickness,
+                "mean_err_um": mean_err_um,
+                "p2p_um": p2p_um,
+                "conicity_um": conicity_um,
+                "conicity_delta_mm": conicity_delta_mm,
+                "conicity_span_mm": conicity_span_mm,
+                "conicity_thresh_um": float(Cfg.CONICITY_THRESH_UM),
+                "status": status,
+                "ok_nominal": ok_nominal,
+                "ok_p2p": ok_p2p,
+                "ok_conicity": ok_conicity,
+                "raw_samples": self.state.sample_count,
+                "duration": (self.state.timestamps_list[-1] if self.state.timestamps_list else 0.0),
+                "raw_trim_count": raw_trim_count,
+                "raw_trim_rate_hz": float(raw_trim_rate_hz),
+                "overall_ok": overall_ok,
+                "fail_reason": fail_reason,
+
+            }
+
+            self.state.passes.append(p)
+
+            # Keep signed mean error history for operator view (bell curve / gauge).
+            try:
+                if mean_err_um is not None:
+                    self.state.err_hist_um.append(float(mean_err_um))
+            except Exception:
+                pass
+
+            try:
+                self.state.ui_queue.put_nowait({"type": "pass", "idx": len(self.state.passes), "pass": p})
+            except queue.Full:
+                pass
+
+        self.state.reset_pass()
+
+# =========================
+# Headless public API
+# =========================
+class ThicknessModule(object):
+    """Convenience wrapper to start/stop readers+processor without the built-in tkinter UI."""
+    def __init__(self, config_path: str | None = None, get_job_limits=None):
+        self.state = ThicknessRuntimeState()
+        self.get_job_limits = get_job_limits  # optional () -> (min_mm, max_mm) for job overrides when running under T3
+        self.readers = []
+        for name, info in Cfg.SENSORS.items():
+            r = SensorReader(self.state, name, info["port"])
+            self.readers.append(r)
+        self.proc = ThicknessProcessor(self.state, get_job_limits=get_job_limits)
+
+    def start(self):
+        for r in self.readers:
+            r.start()
+        self.proc.start()
+
+    def stop(self):
+        self.state.stop_event.set()
+        for r in self.readers:
+            r.join(timeout=0.5)
+        self.proc.join(timeout=0.5)
+
+        # if closed mid-pass, finalize once
+        if self.state.object_in_measurement and self.state.timestamps_list:
+            try:
+                self.proc.process_end_of_measurement()
+            except Exception:
+                pass
+
+    # --- UI-facing API (image only) ---
+    def get_display_image(self, last_n: int = 3, size_px=(420, 550)):
+        """Return a single PIL.Image (RGB) representing the full thickness panel."""
+        return render_thickness_panel_pil(self.state, last_n=last_n, size_px=size_px)
+
+
+    # --- UI-facing API (image + 3 metrics as one synced packet) ---
+    def get_ui_packet(self, last_n: int = 3, size_px=(420, 550)):
+        """Return (image, mean_mm, p2p_um, conicity_signed_um) as a single synced packet."""
+        payload = get_display_payload(self.state, last_n=last_n)
+        img = render_thickness_panel_pil(self.state, last_n=last_n, size_px=size_px)
+        mean_mm = payload.get("mean_thickness_mm", None)
+        p2p_um = payload.get("p2p_um", None)
+        conicity_um = payload.get("conicity_signed_um", None)
+        return img, mean_mm, p2p_um, conicity_um
+
+def _safe_float_list(v):
+    try:
+        return [float(x) for x in v]
+    except Exception:
+        return []
+
+def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
+
+    with state.lock:
+        passes = list(state.passes[-max(1, int(last_n)):]) if state.passes else []
+
+    if not passes:
+        nominal, tol = state.snapshot_nominal_tol()
+        return {
+            "profile_t": [],
+            "profile_th_mm": [],
+            "mean_thickness_mm": None,
+            "mean_err_um": None,
+            "status": "ממתין",
+            "ok_nominal": None,
+            "ok_p2p": None,
+            "nominal_used": nominal,
+            "tol_used_um": tol,
+            "conicity_signed_um": None,
+        "p2p_um": None,
+            "conicity_thresh_um": float(getattr(Cfg, "CONICITY_THRESH_UM", 5.0)),
+        }
+
+    ref = passes[-1]
+    t_common = np.asarray(_safe_float_list(ref.get("avg_t", [])), dtype=float)
+    if t_common.size == 0:
+        # fallback: just show last pass raw (still operator view)
+        t_common = np.asarray(_safe_float_list(ref.get("raw_t", [])), dtype=float)
+
+    ys = []
+    for p in passes:
+        tt = np.asarray(_safe_float_list(p.get("avg_t", [])), dtype=float)
+        yy = np.asarray(_safe_float_list(p.get("avg_y", [])), dtype=float)
+        if tt.size == 0 or yy.size == 0:
+            tt = np.asarray(_safe_float_list(p.get("raw_t", [])), dtype=float)
+            yy = np.asarray(_safe_float_list(p.get("raw_y", [])), dtype=float)
+        if tt.size == 0 or yy.size == 0 or t_common.size == 0:
+            continue
+        if tt.size == t_common.size and np.allclose(tt, t_common):
+            ys.append(yy)
+        else:
+            ys.append(np.interp(t_common, tt, yy))
+
+    if ys:
+        y_mean = np.mean(np.vstack(ys), axis=0)
+    else:
+        y_mean = np.asarray(_safe_float_list(ref.get("avg_y", [])), dtype=float)
+
+    nominal_used = float(ref.get("nominal_used", state.snapshot_nominal_tol()[0]))
+    tol_used_um = float(ref.get("tol_used_um", state.snapshot_nominal_tol()[1]))
+    mean_th = ref.get("mean_thickness", None)
+    mean_err_um = ref.get("mean_err_um", None)
+
+    return {
+        "profile_t": [float(x) for x in t_common.tolist()] if t_common.size else [],
+        "profile_th_mm": [float(x) for x in y_mean.tolist()] if y_mean.size else [],
+        "mean_thickness_mm": float(mean_th) if mean_th is not None else None,
+        "mean_err_um": float(mean_err_um) if mean_err_um is not None else None,
+        "status": str(ref.get("status", "—")),
+        "ok_nominal": ref.get("ok_nominal", None),
+        "ok_p2p": ref.get("ok_p2p", None),
+        "ok_conicity": ref.get("ok_conicity", None),
+        "conicity_span_mm": (float(ref.get("conicity_span_mm")) if ref.get("conicity_span_mm") is not None else None),
+        "nominal_used": nominal_used,
+        "tol_used_um": tol_used_um,
+        "conicity_signed_um": float(ref.get("conicity_signed_um")) if ref.get("conicity_signed_um") is not None else None,
+        "conicity_thresh_um": float(ref.get("conicity_thresh_um", getattr(Cfg, "CONICITY_THRESH_UM", 5.0))),
+        "p2p_um": (float(ref.get("p2p_um")) if ref.get("p2p_um") is not None else None),
+        "overall_ok": ref.get("overall_ok", None),
+        "fail_reason": ref.get("fail_reason", None),
+
+    }
+
+
+# =========================
+# Rendering API (UI should receive ONLY images)
+# =========================
+
+def _profile_plot_pil(profile_t, profile_th_mm, nominal_mm=None, tol_um=None, size_px=(420, 250)):
+    """Render the thickness profile to a PIL RGB image (headless)."""
+    w_px, h_px = size_px
+    dpi = 100
+    fig_w = max(1.0, float(w_px) / dpi)
+    fig_h = max(1.0, float(h_px) / dpi)
+    fig = Figure(figsize=(fig_w, fig_h), dpi=dpi)
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Thickness [mm]")
+    ax.grid(True, alpha=0.3)
+
+    if profile_t and profile_th_mm and len(profile_t) == len(profile_th_mm):
+        ax.plot(profile_t, profile_th_mm, marker="o", markersize=3, linewidth=1.2)
+        if nominal_mm is not None and tol_um is not None:
+            try:
+                tol_mm = float(tol_um) / 1000.0
+                nom = float(nominal_mm)
+                ax.axhline(nom, linewidth=1.0)
+                ax.axhline(nom + tol_mm, linestyle="--", linewidth=0.8)
+                ax.axhline(nom - tol_mm, linestyle="--", linewidth=0.8)
+                ax.set_ylim(nom - 1.5 * tol_mm, nom + 1.5 * tol_mm)
+            except Exception:
+                pass
+    else:
+        ax.text(0.5, 0.5, "Waiting for first part…", ha="center", va="center", transform=ax.transAxes)
+
+    fig.tight_layout(pad=0.6)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    buf = canvas.buffer_rgba()
+    im = Image.frombuffer("RGBA", (w_px, h_px), buf, "raw", "RGBA", 0, 1)
+    return im.convert("RGB")
+
+
+def _smooth_counts(counts, sigma_bins=1.2):
+    sigma = float(max(0.01, sigma_bins))
+    k_half = int(max(2, round(3.0 * sigma)))
+    kernel = []
+    for k in range(-k_half, k_half + 1):
+        kernel.append(float(np.exp(-0.5 * (k / sigma) ** 2)))
+    s = float(sum(kernel)) or 1.0
+    kernel = [v / s for v in kernel]
+
+    out = []
+    n = len(counts)
+    for i in range(n):
+        acc = 0.0
+        for ki, kv in enumerate(kernel):
+            jj = i + (ki - k_half)
+            if 0 <= jj < n:
+                acc += float(counts[jj]) * kv
+        out.append(acc)
+    return out
+
+
+def _gauge_pil(total_um=20, green_half_um=3, yellow_um=1, tick_um=1,
+               pointer_um=None, err_hist_um=None, size_px=(420, 150)):
+    """Draw a gauge (bell curve on top + colored bar + pointer) as a PIL image."""
+    w, h = size_px
+    im = Image.new("RGB", (w, h), "white")
+    dr = ImageDraw.Draw(im)
+
+    pad_x, pad_y = 12, 8
+    x0, x1 = pad_x, w - pad_x
+    half = float(total_um) / 2.0
+
+    def x_of(um):
+        um = max(-half, min(+half, float(um)))
+        return x0 + (um + half) / (2.0 * half) * (x1 - x0)
+
+    # layout
+    bar_h = 22
+    tick_area_h = 26
+    gap = 6
+    bell_y0 = pad_y
+    bell_y1 = max(bell_y0 + 30, h - pad_y - (bar_h + tick_area_h + gap))
+    bar_y0 = bell_y1 + gap
+    bar_y1 = bar_y0 + bar_h
+
+    # zones
+    g0, g1 = -float(green_half_um), +float(green_half_um)
+    y0, y1 = g0 - float(yellow_um), g1 + float(yellow_um)
+    # red base
+    dr.rectangle([x_of(-half), bar_y0, x_of(+half), bar_y1], fill=(192, 57, 43))
+    # yellow
+    dr.rectangle([x_of(y0), bar_y0, x_of(g0), bar_y1], fill=(241, 196, 15))
+    dr.rectangle([x_of(g1), bar_y0, x_of(y1), bar_y1], fill=(241, 196, 15))
+    # green
+    dr.rectangle([x_of(g0), bar_y0, x_of(g1), bar_y1], fill=(39, 174, 96))
+
+    # center line
+    cx = x_of(0.0)
+    dr.line([cx, bar_y0 - 2, cx, bar_y1 + 2], fill=(0, 0, 0), width=2)
+
+    # bell curve (smoothed histogram)
+    vals = [float(v) for v in (err_hist_um or []) if v is not None]
+    if len(vals) >= 3 and (bell_y1 - bell_y0) >= 20:
+        bins = int(max(10, min(80, 30)))
+        step = (2.0 * half) / bins
+        counts = [0] * bins
+        for v in vals:
+            if v < -half or v > +half:
+                continue
+            i = int((v + half) / (2.0 * half) * bins)
+            if i >= bins:
+                i = bins - 1
+            counts[i] += 1
+        smooth = _smooth_counts(counts, sigma_bins=1.2)
+        m = max(smooth) if smooth else 0.0
+        if m > 0:
+            bell_h = float(bell_y1 - bell_y0)
+            dr.line([x_of(-half), bell_y1, x_of(+half), bell_y1], fill=(0, 0, 0), width=1)
+            pts = []
+            for i, sv in enumerate(smooth):
+                um = -half + (i + 0.5) * step
+                x = x_of(um)
+                y = bell_y1 - (float(sv) / m) * (bell_h - 4)
+                pts.append((x, y))
+            for a, b in zip(pts[:-1], pts[1:]):
+                dr.line([a, b], fill=(0, 0, 0), width=2)
+
+    fonts = get_fonts()
+    font = fonts["label"]
+
+    tick_top = bar_y1
+    tick_minor = bar_y1 + 6
+    tick_major = bar_y1 + 10
+    label_y = bar_y1 + 12
+    um = -half
+    while um <= half + 1e-9:
+        x = x_of(um)
+        is_major = (abs(um) < 1e-9) or (int(round(um)) % 5 == 0)
+        dr.line([x, tick_top, x, tick_major if is_major else tick_minor], fill=(0, 0, 0), width=2 if is_major else 1)
+        if is_major:
+            dr.text((x, label_y), f"{int(round(um))}µm", fill=(0, 0, 0), anchor="ma", font=font)
+        um += float(tick_um)
+
+    dr.rectangle([x_of(-half), bar_y0, x_of(+half), bar_y1], outline=(51, 51, 51), width=1)
+
+    # pointer
+    if pointer_um is None:
+        pointer_um = 0.0
+    try:
+        pointer_um = float(pointer_um)
+    except Exception:
+        pointer_um = 0.0
+    pointer_um = max(-half, min(+half, pointer_um))
+    px = x_of(pointer_um)
+
+    tri_h, tri_w = 16, 22
+    shaft_h, shaft_w = 14, 5
+    tip_y = bar_y0 - 1
+    tri_top_y = tip_y - tri_h
+    shaft_top_y = tri_top_y - shaft_h
+
+    dr.rectangle([px - shaft_w / 2, shaft_top_y, px + shaft_w / 2, tri_top_y], fill=(17, 17, 17))
+    dr.polygon([(px, tip_y), (px - tri_w / 2, tri_top_y), (px + tri_w / 2, tri_top_y)], fill=(17, 17, 17))
+
+    return im
+
+
+def _compute_big_status_lines(payload):
+    """Replicates the *meaning* of the current UI big status logic (Hebrew)."""
+    ok = payload.get("overall_ok", None)
+    if ok is True:
+        return [_rtl_visual("תקין")], (0, 128, 0)
+    if ok is None:
+        return [], (0, 0, 0)
+
+    # NOK
+    lines = []
+    err = payload.get("mean_err_um", None)
+    tol = payload.get("tol_used_um", None)
+    if err is not None and tol is not None:
+        try:
+            err_f = float(err)
+            tol_f = float(tol)
+            if abs(err_f) > tol_f:
+                d_mm = abs(err_f) / 1000.0
+                if err_f > 0:
+                    lines.append(f"גבוה מהערך הנומינלי. יש להוריד  {d_mm:.3f} מ''מ")
+                else:
+                    lines.append(f"נמוך מהנומינלי. תיקון: להעלות {d_mm:.3f} מ''מ")
+        except Exception:
+            pass
+
+    c_signed = payload.get("conicity_signed_um", None)
+    c_thr = payload.get("conicity_thresh_um", None)
+    if c_signed is not None and c_thr is not None:
+        try:
+            c_f = float(c_signed)
+            thr_f = float(c_thr)
+            if abs(c_f) > thr_f:
+                span = payload.get("conicity_span_mm", None)
+                if span is not None:
+                    span_f = float(span)
+                    if span_f > 1e-9:
+                        dh_mm = (abs(c_f) * 800.0) / (1000.0 * span_f)
+                        action = "להוריד" if c_f > 0 else "להעלות"
+                        lines.append(f"קוניות גבוהה. תיקון: {action} {dh_mm:.3f} מ\"מ")
+                    else:
+                        lines.append("קוניות גבוהה. (שגיאה: axial_span_mm לא תקין)")
+                else:
+                    lines.append("קוניות גבוהה. (שגיאה: חסר axial_span_mm)")
+        except Exception:
+            pass
+
+    if not lines:
+        reason = payload.get("fail_reason", None)
+        reason_str = str(reason) if reason is not None else ""
+        msg = "לא תקין" + (f" – {reason_str}" if reason_str else "")
+        lines = [msg]
+
+    # Make Hebrew readable in PIL (visual RTL transform)
+    lines = [_rtl_visual(l) for l in lines]
+
+    return lines, (200, 0, 0)
+
+
+def render_thickness_panel_pil(state: ThicknessRuntimeState, last_n: int = 3, size_px=(420, 900)):
+    """One-stop renderer: returns a single PIL image representing the whole thickness panel."""
+    W, H = size_px
+    payload = get_display_payload(state, last_n=last_n)
+
+    # base
+    im = Image.new("RGB", (W, H), "white")
+    dr = ImageDraw.Draw(im)
+
+    fonts = get_fonts()
+    font_label = fonts["label"]
+    font_value = fonts["value"]
+    font_status = fonts["status"]
+    font_symbol = fonts["symbol"]
+    font_emoji = fonts["emoji"]
+
+    # ---- top indicators (4 boxes) ----
+    pad = 8
+    box_h = 80
+    gap = 6
+    box_w = (W - 2 * pad - 3 * gap) // 4
+    y0 = pad
+    labels = [_rtl_visual(s) for s in ["מקבילות", "קוניות", "נומינלי", "ממוצע"]]
+
+    err = payload.get("mean_err_um", None)
+    tol = payload.get("tol_used_um", None)
+
+    # parallel indicator
+    if err is None or tol is None:
+        parallel_txt = "—"
+    else:
+        try:
+            err_f = float(err)
+            tol_f = float(tol)
+            # Use the original UI symbols (Tk shows them fine; we render with Segoe fonts).
+            parallel_txt = "👍" if abs(err_f) <= tol_f else ("↓" if err_f > 0 else "↑")
+        except Exception:
+            parallel_txt = "—"
+
+    # conicity indicator
+    c_signed = payload.get("conicity_signed_um", None)
+    c_thr = payload.get("conicity_thresh_um", None)
+    if c_signed is None or c_thr is None:
+        conicity_txt = "—"
+    else:
+        try:
+            c_f = float(c_signed)
+            thr_f = float(c_thr)
+            # Use the original UI symbols.
+            conicity_txt = "👍" if abs(c_f) <= thr_f else ("↻" if c_f > 0 else "↺")
+        except Exception:
+            conicity_txt = "—"
+
+    nom = payload.get("nominal_used", None)
+    mean_th = payload.get("mean_thickness_mm", None)
+    nom_txt = f"{float(nom):.3f} mm" if nom is not None else "—"
+    mean_txt = f"{float(mean_th):.3f} mm" if mean_th is not None else "—"
+
+    values = [parallel_txt, conicity_txt, nom_txt, mean_txt]
+
+    for i in range(4):
+        x = pad + i * (box_w + gap)
+        dr.rectangle([x, y0, x + box_w, y0 + box_h], outline=(120, 120, 120), width=1)
+        dr.text((x + box_w / 2, y0 + 10), labels[i], fill=(0, 0, 0), anchor="ma", font=font_label)
+        vtxt = str(values[i])
+        vfont = (font_emoji if vtxt == '👍' else (font_symbol if any(ch in vtxt for ch in ['↓','↑','↻','↺']) else font_value))
+        # --- icons for Parallel / Conicity (boxes 0 and 1) ---
+        icon_sz = 22
+
+        if i == 0:
+            ico = _load_icon_png("icons\\parallel.png", icon_sz)
+        elif i == 1:
+            ico = _load_icon_png("icons\\cone.png", icon_sz)
+        else:
+            ico = None
+
+        if ico is not None:
+            ix = int(x + (box_w - icon_sz) / 2)
+            iy = int(y0 + 24)  # כוונון גובה בתוך המלבן
+            im.paste(ico, (ix, iy), ico)
+            value_y = y0 + 52  # מורידים את הטקסט מתחת לאייקון
+        else:
+            value_y = y0 + 40
+
+        dr.text((x + box_w / 2, value_y), vtxt, fill=(0, 0, 0), anchor="ma", font=vfont)
+
+    # ---- big status ----
+    status_lines, status_color = _compute_big_status_lines(payload)
+    y = y0 + box_h + 8
+    for line in status_lines[:2]:
+        dr.text((W - pad, y), line, fill=status_color, anchor="ra", font=font_status)
+        y += 16
+
+    # ---- gauge ----
+    gauge_y = y0 + box_h + 45
+    gauge = _gauge_pil(
+        total_um=20,
+        green_half_um=3,
+        yellow_um=1,
+        tick_um=1,
+        pointer_um=payload.get("mean_err_um", None),
+        err_hist_um=list(getattr(state, "err_hist_um", []) or []),
+        size_px=(W - 2 * pad, 150),
+    )
+    im.paste(gauge, (pad, gauge_y))
+
+    # ---- profile plot ----
+    plot_y = gauge_y + 150 + 20
+    plot = _profile_plot_pil(
+        payload.get("profile_t", []),
+        payload.get("profile_th_mm", []),
+        nominal_mm=payload.get("nominal_used", None),
+        tol_um=payload.get("tol_used_um", None),
+        size_px=(W - 2 * pad, 250),
+    )
+    im.paste(plot, (pad, plot_y))
+
+    # ---- small status line (bottom) ----
+    txt_y = plot_y + 250 + 4
+    mean_err = payload.get("mean_err_um", None)
+    mean_th2 = payload.get("mean_thickness_mm", None)
+    status = payload.get("status", "—")
+    if mean_th2 is not None and mean_err is not None:
+        c = payload.get("conicity_signed_um", None)
+        c_txt = f" | cone={float(c):+.1f} µm" if c is not None else ""
+        bottom_txt = f"{status} | mean={float(mean_th2):.5f} mm | Δ={float(mean_err):+.1f} µm{c_txt}"
+    else:
+        bottom_txt = str(status)
+
+    # Bottom status: keep readable for Hebrew
+    if _HEB_RE.search(str(bottom_txt)):
+        bt = _rtl_visual(str(bottom_txt))
+        dr.text((W - pad, txt_y), bt, fill=(0, 0, 0), anchor="ra", font=font_label)
+    else:
+        dr.text((pad, txt_y), str(bottom_txt), fill=(0, 0, 0), anchor="la", font=font_label)
+
+    return im
+
+
+

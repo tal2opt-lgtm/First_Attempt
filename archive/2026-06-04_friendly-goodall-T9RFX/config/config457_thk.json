@@ -1,0 +1,40 @@
+{
+  "schema_version": "2.0",
+  "sensors": {
+    "TOP": {
+      "ip": "192.168.2.160",
+      "port": 5010
+    },
+    "BOTTOM": {
+      "ip": "192.168.2.161",
+      "port": 5009
+    }
+  },
+  "socket_timeout_sec": 0.002,
+  "frame_interval_sec": 0.001,
+  "time_sync_threshold_sec": 0.001,
+  "live_update_hz": 20.0,
+  "error_threshold_mm": 990.0,
+  "axial_span_mm": 19.9,
+  "thickness_min_mm": 0.3,
+  "thickness_max_mm": 3.0,
+  "max_error_count": 5,
+  "error_gap_sec": 0.05,
+  "target_points": 20,
+  "trim_lo": 0.15,
+  "trim_hi": 0.85,
+  "p2p_thresh_um": 8.0,
+  "nominal_thickness_mm_default": 2.598,
+  "tol_um_default": 4.0,
+  "plc_ip": "192.168.3.76",
+  "plc_port": 502,
+  "calibration": {
+    "gauge_small_known_mm": null,
+    "gauge_large_known_mm": null,
+    "window_sec": 1.0,
+    "stability_max_std_um": 5.0,
+    "slope_min": -1.10,
+    "slope_max": -0.90,
+    "max_parts_before_recal": 100
+  }
+}
