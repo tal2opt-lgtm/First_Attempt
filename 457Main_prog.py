@@ -991,7 +991,6 @@ class EL_UI(tk.Tk):
                 ("time_sync_threshold_sec", "time_sync_threshold_sec"),
                 ("live_update_hz", "live_update_hz"),
                 ("reference_height_mm", "reference_height_mm"),
-                ("sensor_distance_mm", "sensor_distance_mm"),
                 ("error_threshold_mm", "error_threshold_mm"),
                 ("axial_span_mm", "axial_span_mm"),
                 ("thickness_min_mm", "thickness_min_mm"),
@@ -1106,7 +1105,7 @@ class EL_UI(tk.Tk):
                     except ValueError:
                         val = 0
                 elif key_path in ("socket_timeout_sec", "frame_interval_sec", "time_sync_threshold_sec", "reference_height_mm",
-                                  "sensor_distance_mm", "error_threshold_mm", "axial_span_mm", "thickness_min_mm", "thickness_max_mm",
+                                  "error_threshold_mm", "axial_span_mm", "thickness_min_mm", "thickness_max_mm",
                                   "trim_lo", "trim_hi", "p2p_thresh_um", "conicity_thresh_um", "nominal_thickness_mm_default", "tol_um_default"):
                     try:
                         val = float(raw) if raw else 0.0

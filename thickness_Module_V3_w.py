@@ -143,7 +143,6 @@ class ThicknessConfig(object):
         self.LIVE_UPDATE_HZ = float(req("live_update_hz"))
 
         self.REFERENCE_HEIGHT_MM = float(req("reference_height_mm"))
-        self.SENSOR_DISTANCE_MM = float(req("sensor_distance_mm"))
         self.ERROR_THRESHOLD_MM = float(req("error_threshold_mm"))
         self.AXIAL_SPAN_MM = float(req("axial_span_mm"))
 
@@ -162,17 +161,24 @@ class ThicknessConfig(object):
         self.NOMINAL_THICKNESS_MM_DEFAULT = float(req("nominal_thickness_mm_default"))
         self.TOL_UM_DEFAULT = float(req("tol_um_default"))
 
-        # --- Two-gauge linear calibration (all optional; defaults = no-op a=1,b=0) ---
-        # thickness_corrected = a * thickness_raw + b
+        # --- Two-gauge linear calibration ---
+        # thickness = a * sensors_sum_mm + b   (sensors_sum = top + bottom distances)
+        # Gain `a` is negative (thicker part => smaller sensor sum); magnitude near 1.0.
+        # A measurement is produced ONLY when calibration.valid is True; until then the
+        # processor refuses to emit verdicts and the UI is expected to require calibration.
         cal = d.get("calibration", {}) or {}
         self.CAL_GAUGE_1_MM = float(cal["gauge_1_known_mm"]) if cal.get("gauge_1_known_mm") is not None else None
         self.CAL_GAUGE_2_MM = float(cal["gauge_2_known_mm"]) if cal.get("gauge_2_known_mm") is not None else None
         self.CAL_WINDOW_SEC = float(cal.get("window_sec", 3.0))
         self.CAL_STABILITY_MAX_STD_UM = float(cal.get("stability_max_std_um", 5.0))
-        self.CAL_GAIN_MIN = float(cal.get("gain_min", 0.95))
-        self.CAL_GAIN_MAX = float(cal.get("gain_max", 1.05))
-        self.CAL_A = float(cal.get("a", 1.0))
-        self.CAL_B = float(cal.get("b", 0.0))
+        self.CAL_GAIN_MIN = float(cal.get("gain_min", -1.5))
+        self.CAL_GAIN_MAX = float(cal.get("gain_max", -0.5))
+        self.CAL_A = float(cal["a"]) if cal.get("a") is not None else None
+        self.CAL_B = float(cal["b"]) if cal.get("b") is not None else None
+        self.CAL_VALID = bool(cal.get("valid", False))
+        # Drift detection: warn if |D_implied - median(history)| exceeds this threshold [mm].
+        self.CAL_DRIFT_WARN_MM = float(cal.get("drift_warn_mm", 0.5))
+        self.CAL_HISTORY_MAX = int(cal.get("history_max", 20))
 
 class ThicknessRuntimeState(object):
     def __init__(self, cfg: ThicknessConfig):
@@ -206,10 +212,12 @@ class ThicknessRuntimeState(object):
 
         # --- Calibration runtime state ---
         self.cal_lock = threading.Lock()
-        self.cal_a = float(cfg.CAL_A)          # active gain  (applied to every measurement)
-        self.cal_b = float(cfg.CAL_B)          # active offset [mm]
-        self.cal_collecting = False            # when True, run() captures raw thickness instead of processing parts
-        self.cal_buffer = []                   # raw thickness samples gathered during a gauge measurement
+        self.cal_a = float(cfg.CAL_A) if cfg.CAL_A is not None else None  # active gain (applied to every measurement)
+        self.cal_b = float(cfg.CAL_B) if cfg.CAL_B is not None else None  # active offset [mm]
+        self.cal_valid = bool(cfg.CAL_VALID and cfg.CAL_A is not None and cfg.CAL_B is not None)
+        self.cal_collecting = False            # when True, run() captures sensor_sum samples instead of processing parts
+        self.cal_buffer = []                   # raw sensor_sum samples gathered during a gauge measurement
+        self.last_drift_warning = None         # populated by compute_and_apply_calibration when drift exceeds threshold
 
     def reset_pass(self):
         self.object_in_measurement = False
@@ -225,16 +233,26 @@ class ThicknessRuntimeState(object):
             return float(self.nominal_thickness_mm), float(self.tol_um)
 
     # --- Calibration helpers ---
-    def apply_calibration(self, thk_raw_mm):
-        """Apply the active linear calibration to a raw thickness sample."""
+    def apply_calibration(self, sensors_sum_mm):
+        """Apply the active linear calibration to a sensor-sum sample.
+
+        Returns None when no valid calibration is loaded; callers must check.
+        """
         with self.cal_lock:
+            if not self.cal_valid or self.cal_a is None or self.cal_b is None:
+                return None
             a, b = self.cal_a, self.cal_b
-        return a * thk_raw_mm + b
+        return a * sensors_sum_mm + b
 
     def set_calibration(self, a, b):
         with self.cal_lock:
             self.cal_a = float(a)
             self.cal_b = float(b)
+            self.cal_valid = True
+
+    def is_calibrated(self):
+        with self.cal_lock:
+            return bool(self.cal_valid and self.cal_a is not None and self.cal_b is not None)
 
     def cal_begin_collect(self):
         with self.lock:
@@ -350,16 +368,20 @@ class ThicknessProcessor(object):
             else:
                 self.state.error_count = 0
 
-            thickness_raw = self.cfg.SENSOR_DISTANCE_MM - (top_abs_mm + bot_abs_mm)
+            sensors_sum_mm = top_abs_mm + bot_abs_mm
 
-            # Calibration capture mode: gather raw thickness, skip all part/pass logic
+            # Calibration capture mode: gather raw sensor-sum, skip all part/pass logic
             # (so no verdict is produced to the PLC while a gauge is being measured).
             if self.state.cal_collecting:
-                self.state.cal_add_sample(thickness_raw)
+                self.state.cal_add_sample(sensors_sum_mm)
                 continue
 
-            # Normal path: apply the active linear calibration, then process as usual.
-            thickness = self.state.apply_calibration(thickness_raw)
+            # Normal path requires a valid two-point linearization.
+            # Until the operator runs the calibration sequence, samples are discarded
+            # so that no verdict is produced from un-trustable measurements.
+            thickness = self.state.apply_calibration(sensors_sum_mm)
+            if thickness is None:
+                continue
 
             if self.cfg.THICKNESS_MIN <= thickness <= self.cfg.THICKNESS_MAX:
                 t_pair = (t_time + b_time) / 2.0
@@ -599,15 +621,16 @@ class ThicknessModule(object):
                 "n": len(data), "raw_median_mm": med, "std_um": std_um}
 
     def compute_and_apply_calibration(self, raw_g1_mm, raw_g2_mm):
-        """Two-point linear fit from the two gauge raw readings.
+        """Two-point linear fit from the two gauge sensor-sum readings.
 
         Pairs (raw_g1 -> CAL_GAUGE_1_MM) and (raw_g2 -> CAL_GAUGE_2_MM), solves
-        thickness_corrected = a*raw + b, validates the gain bounds, and on success
-        applies it live and persists it to the config JSON.
+        thickness = a*sensor_sum + b, validates the gain bounds, and on success
+        applies it live and persists it (with a drift-tracking history) to the
+        config JSON.
 
-        Returns (ok: bool, info: dict{a, b, reason}).
+        Returns (ok: bool, info: dict{a, b, d_implied, drift_warning, reason}).
         """
-        info = {"a": None, "b": None, "reason": ""}
+        info = {"a": None, "b": None, "d_implied": None, "drift_warning": None, "reason": ""}
         k1, k2 = self.cfg.CAL_GAUGE_1_MM, self.cfg.CAL_GAUGE_2_MM
         if k1 is None or k2 is None:
             info["reason"] = "gauge known values not configured"
@@ -629,32 +652,99 @@ class ThicknessModule(object):
             info["reason"] = f"gain {a:.4f} out of bounds [{self.cfg.CAL_GAIN_MIN}, {self.cfg.CAL_GAIN_MAX}]"
             return False, info
 
+        # Effective sensor distance implied by this calibration: solving for the
+        # sensor_sum that yields thickness=0 gives S0 = -b/a, which is mechanically
+        # the gap between the sensors at zero part thickness.
+        d_implied = -b / a
+        info["d_implied"] = float(d_implied)
+
+        # Compare against the median of recent calibrations on this machine. If the
+        # difference exceeds the configured threshold, surface a warning — but do
+        # NOT block the calibration: the operator decides whether to accept.
+        drift_warning = self._check_drift(d_implied)
+        info["drift_warning"] = drift_warning
+        self.state.last_drift_warning = drift_warning
+
         # Apply live and remember on the loaded cfg, then persist.
         self.state.set_calibration(a, b)
         self.cfg.CAL_A, self.cfg.CAL_B = a, b
-        self._save_calibration(a, b, raw_g1_mm, raw_g2_mm)
+        self.cfg.CAL_VALID = True
+        self._save_calibration(a, b, raw_g1_mm, raw_g2_mm, d_implied)
         info["reason"] = "ok"
         return True, info
 
-    def get_calibration(self):
-        """Return the currently active calibration {a, b}."""
-        with self.state.cal_lock:
-            return {"a": float(self.state.cal_a), "b": float(self.state.cal_b)}
+    def _check_drift(self, d_implied_new):
+        """Compare new D_implied against the median of stored history.
 
-    def _save_calibration(self, a, b, raw_g1, raw_g2):
+        Returns a human-readable warning string when |delta| > CAL_DRIFT_WARN_MM,
+        or None when history is empty or the calibration is consistent.
+        """
+        try:
+            data = load_config_json(self.config_path)
+        except Exception:
+            return None
+        history = (data.get("calibration", {}) or {}).get("history", []) or []
+        if not history:
+            return None
+        recent = [float(h["d_implied"]) for h in history[-5:] if "d_implied" in h]
+        if not recent:
+            return None
+        median = float(np.median(np.array(recent, dtype=float)))
+        delta = float(d_implied_new) - median
+        if abs(delta) > float(self.cfg.CAL_DRIFT_WARN_MM):
+            return (f"drift detected: D_implied={d_implied_new:.4f}mm vs recent median "
+                    f"{median:.4f}mm (Δ={delta:+.4f}mm, threshold={self.cfg.CAL_DRIFT_WARN_MM}mm)")
+        return None
+
+    def get_calibration(self):
+        """Return the currently active calibration {a, b, valid}."""
+        with self.state.cal_lock:
+            a = self.state.cal_a
+            b = self.state.cal_b
+            valid = bool(self.state.cal_valid and a is not None and b is not None)
+            return {
+                "a": (float(a) if a is not None else None),
+                "b": (float(b) if b is not None else None),
+                "valid": valid,
+            }
+
+    def is_calibrated(self):
+        """True iff a valid two-point linearization is loaded and active."""
+        return self.state.is_calibrated()
+
+    def _save_calibration(self, a, b, raw_g1, raw_g2, d_implied):
         """Persist calibration results into the 'calibration' block of the config JSON,
-        preserving every other key. Failures here never crash the run."""
+        preserving every other key. Appends a history entry for drift detection.
+        Failures here never crash the run."""
         try:
             try:
                 data = load_config_json(self.config_path)
             except Exception:
                 data = {}
             cal = data.get("calibration", {}) or {}
+            iso = time.strftime("%Y-%m-%dT%H:%M:%S")
             cal["a"] = float(a)
             cal["b"] = float(b)
             cal["raw_g1_mm"] = float(raw_g1)
             cal["raw_g2_mm"] = float(raw_g2)
-            cal["last_calibration_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            cal["d_implied_mm"] = float(d_implied)
+            cal["valid"] = True
+            cal["last_calibration_iso"] = iso
+
+            history = list(cal.get("history", []) or [])
+            history.append({
+                "iso": iso,
+                "a": float(a),
+                "b": float(b),
+                "d_implied_mm": float(d_implied),
+                "raw_g1_mm": float(raw_g1),
+                "raw_g2_mm": float(raw_g2),
+            })
+            max_hist = int(getattr(self.cfg, "CAL_HISTORY_MAX", 20) or 20)
+            if len(history) > max_hist:
+                history = history[-max_hist:]
+            cal["history"] = history
+
             data["calibration"] = cal
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
