@@ -25,5 +25,15 @@
   "trim_hi": 0.85,
   "p2p_thresh_um": 8.0,
   "nominal_thickness_mm_default": 2.554,
-  "tol_um_default": 4.0
+  "tol_um_default": 4.0,
+  "calibration": {
+    "gauge_1_known_mm": null,
+    "gauge_2_known_mm": null,
+    "window_sec": 3.0,
+    "stability_max_std_um": 5.0,
+    "gain_min": -1.5,
+    "gain_max": -0.5,
+    "drift_warn_mm": 0.5,
+    "history_max": 20
+  }
 }
