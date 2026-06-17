@@ -25,6 +25,7 @@
   "trim_lo": 0.15,
   "trim_hi": 0.85,
   "p2p_thresh_um": 8.0,
+  "conicity_thresh_um": 5.0,
   "nominal_thickness_mm_default": 2.554,
   "tol_um_default": 4.0
 }

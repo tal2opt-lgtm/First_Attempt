@@ -102,11 +102,7 @@ def _rtl_visual(text: str) -> str:
 # =========================
 # JSON Machine Config
 # =========================
-def load_config_json(path: str) -> dict:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Config JSON not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+
 
 # =========================
 # Helpers: parse PUSH packet
@@ -126,57 +122,88 @@ def parse_push_packet(data: bytes):
 # =========================
 class ThicknessConfig(object):
     """Fixed parameters loaded from JSON (no in-code defaults)."""
-    def __init__(self, cfg_dict: dict):
-        if cfg_dict is None:
-            raise ValueError("ThicknessConfig requires cfg_dict loaded from JSON")
-        d = cfg_dict
+    def __init__(self ):
+        self._config_path = str(Path(__file__).parent / "config" / "config457_thk.json")
+        self._load_from_dict(self._load_json())
 
-        def req(key: str):
+    def _load_json(self):
+        if not os.path.isfile(self._config_path):
+            raise FileNotFoundError(f"Config JSON not found: {self._config_path}")
+        with open(self._config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_from_dict(self, d):
+        required = (
+            "sensors", "socket_timeout_sec", "frame_interval_sec", "time_sync_threshold_sec",
+            "live_update_hz", "reference_height_mm", "sensor_distance_mm", "error_threshold_mm",
+            "axial_span_mm", "thickness_min_mm", "thickness_max_mm", "max_error_count",
+            "target_points", "trim_lo", "trim_hi", "p2p_thresh_um",
+            "nominal_thickness_mm_default", "tol_um_default",
+        )
+        for key in required:
             if key not in d:
                 raise KeyError(f"Missing required config key: {key}")
-            return d[key]
 
-        self.SENSORS = req("sensors")
-        self.SOCKET_TIMEOUT = float(req("socket_timeout_sec"))
-        self.FRAME_INTERVAL_SEC = float(req("frame_interval_sec"))
-        self.TIME_SYNC_THRESHOLD = float(req("time_sync_threshold_sec"))
-        self.LIVE_UPDATE_HZ = float(req("live_update_hz"))
+        self.SENSORS = d["sensors"]
+        self.SOCKET_TIMEOUT = d["socket_timeout_sec"]
+        self.FRAME_INTERVAL_SEC = d["frame_interval_sec"]
+        self.TIME_SYNC_THRESHOLD = d["time_sync_threshold_sec"]
+        self.LIVE_UPDATE_HZ = d["live_update_hz"]
 
-        self.REFERENCE_HEIGHT_MM = float(req("reference_height_mm"))
-        self.SENSOR_DISTANCE_MM = float(req("sensor_distance_mm"))
-        self.ERROR_THRESHOLD_MM = float(req("error_threshold_mm"))
-        self.AXIAL_SPAN_MM = float(req("axial_span_mm"))
+        self.REFERENCE_HEIGHT_MM = d["reference_height_mm"]
+        self.SENSOR_DISTANCE_MM = d["sensor_distance_mm"]
+        self.ERROR_THRESHOLD_MM = d["error_threshold_mm"]
+        self.AXIAL_SPAN_MM = d["axial_span_mm"]
 
-        self.THICKNESS_MIN = float(req("thickness_min_mm"))
-        self.THICKNESS_MAX = float(req("thickness_max_mm"))
-        self.MAX_ERROR_COUNT = int(req("max_error_count"))
+        self.THICKNESS_MIN = d["thickness_min_mm"]
+        self.THICKNESS_MAX = d["thickness_max_mm"]
+        self.MAX_ERROR_COUNT = d["max_error_count"]
 
-        self.TARGET_POINTS = int(req("target_points"))
-        self.TRIM_LO = float(req("trim_lo"))
-        self.TRIM_HI = float(req("trim_hi"))
-        self.P2P_THRESH_UM = float(req("p2p_thresh_um"))
+        self.TARGET_POINTS = d["target_points"]
+        self.TRIM_LO = d["trim_lo"]
+        self.TRIM_HI = d["trim_hi"]
+        self.P2P_THRESH_UM = d["p2p_thresh_um"]
 
-        # Conicity threshold [µm] (operator spec): default 5µm unless provided in JSON
-        self.CONICITY_THRESH_UM = float(d.get("conicity_thresh_um", 5.0))
+        self.CONICITY_THRESH_UM = d.get("conicity_thresh_um", 5.0)
 
-        self.NOMINAL_THICKNESS_MM_DEFAULT = float(req("nominal_thickness_mm_default"))
-        self.TOL_UM_DEFAULT = float(req("tol_um_default"))
+        self.NOMINAL_THICKNESS_MM_DEFAULT = d["nominal_thickness_mm_default"]
+        self.TOL_UM_DEFAULT = d["tol_um_default"]
 
-        # --- Two-gauge linear calibration (all optional; defaults = no-op a=1,b=0) ---
-        # thickness_corrected = a * thickness_raw + b
-        cal = d.get("calibration", {}) or {}
-        self.CAL_GAUGE_1_MM = float(cal["gauge_1_known_mm"]) if cal.get("gauge_1_known_mm") is not None else None
-        self.CAL_GAUGE_2_MM = float(cal["gauge_2_known_mm"]) if cal.get("gauge_2_known_mm") is not None else None
-        self.CAL_WINDOW_SEC = float(cal.get("window_sec", 3.0))
-        self.CAL_STABILITY_MAX_STD_UM = float(cal.get("stability_max_std_um", 5.0))
-        self.CAL_GAIN_MIN = float(cal.get("gain_min", 0.95))
-        self.CAL_GAIN_MAX = float(cal.get("gain_max", 1.05))
-        self.CAL_A = float(cal.get("a", 1.0))
-        self.CAL_B = float(cal.get("b", 0.0))
+    def load(self):
+        """Reload config from the same path used in __init__."""
+        self._load_from_dict(self._load_json())
+
+    def save(self):
+        """Save config to JSON file (indented)."""
+        d = {
+            "schema_version": "1.0",
+            "sensors": self.SENSORS,
+            "socket_timeout_sec": self.SOCKET_TIMEOUT,
+            "frame_interval_sec": self.FRAME_INTERVAL_SEC,
+            "time_sync_threshold_sec": self.TIME_SYNC_THRESHOLD,
+            "live_update_hz": self.LIVE_UPDATE_HZ,
+            "reference_height_mm": self.REFERENCE_HEIGHT_MM,
+            "sensor_distance_mm": self.SENSOR_DISTANCE_MM,
+            "error_threshold_mm": self.ERROR_THRESHOLD_MM,
+            "axial_span_mm": self.AXIAL_SPAN_MM,
+            "thickness_min_mm": self.THICKNESS_MIN,
+            "thickness_max_mm": self.THICKNESS_MAX,
+            "max_error_count": self.MAX_ERROR_COUNT,
+            "target_points": self.TARGET_POINTS,
+            "trim_lo": self.TRIM_LO,
+            "trim_hi": self.TRIM_HI,
+            "p2p_thresh_um": self.P2P_THRESH_UM,
+            "conicity_thresh_um": self.CONICITY_THRESH_UM,
+            "nominal_thickness_mm_default": self.NOMINAL_THICKNESS_MM_DEFAULT,
+            "tol_um_default": self.TOL_UM_DEFAULT,
+        }
+        with open(self._config_path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+
+Cfg = ThicknessConfig()
 
 class ThicknessRuntimeState(object):
-    def __init__(self, cfg: ThicknessConfig):
-        self.cfg = cfg
+    def __init__(self):
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
 
@@ -199,17 +226,10 @@ class ThicknessRuntimeState(object):
         self.err_hist_um = deque(maxlen=60)
 
         self.nominal_lock = threading.Lock()
-        self.nominal_thickness_mm = float(cfg.NOMINAL_THICKNESS_MM_DEFAULT)
-        self.tol_um = float(cfg.TOL_UM_DEFAULT)
+        self.nominal_thickness_mm = float(Cfg.NOMINAL_THICKNESS_MM_DEFAULT)
+        self.tol_um = float(Cfg.TOL_UM_DEFAULT)
 
         self._last_live_push = 0.0
-
-        # --- Calibration runtime state ---
-        self.cal_lock = threading.Lock()
-        self.cal_a = float(cfg.CAL_A)          # active gain  (applied to every measurement)
-        self.cal_b = float(cfg.CAL_B)          # active offset [mm]
-        self.cal_collecting = False            # when True, run() captures raw thickness instead of processing parts
-        self.cal_buffer = []                   # raw thickness samples gathered during a gauge measurement
 
     def reset_pass(self):
         self.object_in_measurement = False
@@ -224,33 +244,6 @@ class ThicknessRuntimeState(object):
         with self.nominal_lock:
             return float(self.nominal_thickness_mm), float(self.tol_um)
 
-    # --- Calibration helpers ---
-    def apply_calibration(self, thk_raw_mm):
-        """Apply the active linear calibration to a raw thickness sample."""
-        with self.cal_lock:
-            a, b = self.cal_a, self.cal_b
-        return a * thk_raw_mm + b
-
-    def set_calibration(self, a, b):
-        with self.cal_lock:
-            self.cal_a = float(a)
-            self.cal_b = float(b)
-
-    def cal_begin_collect(self):
-        with self.lock:
-            self.cal_buffer = []
-            self.cal_collecting = True
-
-    def cal_add_sample(self, v_mm):
-        self.cal_buffer.append(float(v_mm))
-
-    def cal_end_collect(self):
-        with self.lock:
-            self.cal_collecting = False
-            data = list(self.cal_buffer)
-            self.cal_buffer = []
-        return data
-
 def setup_socket(port: int, timeout_sec: float):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("", port))
@@ -258,8 +251,7 @@ def setup_socket(port: int, timeout_sec: float):
     return s
 
 class SensorReader(object):
-    def __init__(self, cfg: ThicknessConfig, state: ThicknessRuntimeState, name: str, port: int):
-        self.cfg = cfg
+    def __init__(self, state: ThicknessRuntimeState, name: str, port: int):
         self.state = state
         self.name = name
         self.port = int(port)
@@ -272,7 +264,7 @@ class SensorReader(object):
         self.thread.join(timeout=timeout)
 
     def run(self):
-        sock = setup_socket(self.port, self.cfg.SOCKET_TIMEOUT)
+        sock = setup_socket(self.port, Cfg.SOCKET_TIMEOUT)
         while not self.state.stop_event.is_set():
             while True:
                 try:
@@ -287,7 +279,7 @@ class SensorReader(object):
                     # --- Time tagging (burst-robust) ---
                     # Do NOT use time.time() as the packet timestamp (it causes "time clumping" under CPU load).
                     # Instead, advance a per-sensor virtual clock by the configured frame interval.
-                    interval = float(self.cfg.FRAME_INTERVAL_SEC)
+                    interval = float(Cfg.FRAME_INTERVAL_SEC)
                     dt = interval / num
 
                     with self.state.lock:
@@ -297,7 +289,7 @@ class SensorReader(object):
                             last = time.time() - interval
                         for v_mm in vals_mm:
                             last += dt
-                            abs_mm = self.cfg.REFERENCE_HEIGHT_MM + v_mm
+                            abs_mm = Cfg.REFERENCE_HEIGHT_MM + v_mm
                             self.state.samples[self.name].append((last, abs_mm))
                         self.state.last_ts[self.name] = last
                 except socket.timeout:
@@ -305,9 +297,9 @@ class SensorReader(object):
             time.sleep(0.0005)
 
 class ThicknessProcessor(object):
-    def __init__(self, cfg: ThicknessConfig, state: ThicknessRuntimeState):
-        self.cfg = cfg
+    def __init__(self, state: ThicknessRuntimeState, get_job_limits=None):
         self.state = state
+        self.get_job_limits = get_job_limits  # optional callable () -> (min_mm, max_mm) | (None, None); used when running under T3
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self):
@@ -326,7 +318,7 @@ class ThicknessProcessor(object):
                     b_t, _ = self.state.samples["BOTTOM"][0]
                     dt = abs(t_t - b_t)
 
-                    if dt <= self.cfg.TIME_SYNC_THRESHOLD:
+                    if dt <= Cfg.TIME_SYNC_THRESHOLD:
                         t_samp = self.state.samples["TOP"].popleft()
                         b_samp = self.state.samples["BOTTOM"].popleft()
                     else:
@@ -342,26 +334,18 @@ class ThicknessProcessor(object):
             t_time, top_abs_mm = t_samp
             b_time, bot_abs_mm = b_samp
 
-            if top_abs_mm >= self.cfg.ERROR_THRESHOLD_MM and bot_abs_mm >= self.cfg.ERROR_THRESHOLD_MM:
-                self.state.error_count += 1
-                if self.state.object_in_measurement and self.state.error_count >= self.cfg.MAX_ERROR_COUNT:
-                    self.process_end_of_measurement()
-                continue
-            else:
+            # Unified error / valid logic: ANY sample whose computed thickness falls
+            # outside [THICKNESS_MIN, THICKNESS_MAX] counts as an "error" sample.
+            # This handles both end-of-part (sensors empty -> thickness out of range)
+            # AND short surface features like holes/grooves whose thickness reading is
+            # off the bulk surface. Short error runs (< MAX_ERROR_COUNT) reset on the
+            # next in-range sample, so a feature is silently skipped and the pass
+            # continues with only the bulk-surface samples in the average.
+            thickness = Cfg.SENSOR_DISTANCE_MM - (top_abs_mm + bot_abs_mm)
+
+            min_mm, max_mm = self._effective_min_max_mm()
+            if min_mm <= thickness <= max_mm:
                 self.state.error_count = 0
-
-            thickness_raw = self.cfg.SENSOR_DISTANCE_MM - (top_abs_mm + bot_abs_mm)
-
-            # Calibration capture mode: gather raw thickness, skip all part/pass logic
-            # (so no verdict is produced to the PLC while a gauge is being measured).
-            if self.state.cal_collecting:
-                self.state.cal_add_sample(thickness_raw)
-                continue
-
-            # Normal path: apply the active linear calibration, then process as usual.
-            thickness = self.state.apply_calibration(thickness_raw)
-
-            if self.cfg.THICKNESS_MIN <= thickness <= self.cfg.THICKNESS_MAX:
                 t_pair = (t_time + b_time) / 2.0
                 if not self.state.object_in_measurement:
                     self.state.object_in_measurement = True
@@ -374,7 +358,7 @@ class ThicknessProcessor(object):
                 self.state.thickness_values.append(thickness)
 
                 now = time.time()
-                if now - self.state._last_live_push >= 1.0 / max(1.0, float(self.cfg.LIVE_UPDATE_HZ)):
+                if now - self.state._last_live_push >= 1.0 / max(1.0, float(Cfg.LIVE_UPDATE_HZ)):
                     self.state._last_live_push = now
                     nominal_used, _ = self.state.snapshot_nominal_tol()
                     err_um = (thickness - nominal_used) * 1000.0
@@ -382,6 +366,13 @@ class ThicknessProcessor(object):
                         self.state.ui_queue.put_nowait({"type": "live", "thickness_mm": thickness, "err_um": err_um})
                     except queue.Full:
                         pass
+            else:
+                # Out of range: empty sensors OR sample inside a hole/groove.
+                # Treated identically — count toward end-of-part. Short runs reset
+                # automatically when the next valid (in-range) sample arrives.
+                self.state.error_count += 1
+                if self.state.object_in_measurement and self.state.error_count >= Cfg.MAX_ERROR_COUNT:
+                    self.process_end_of_measurement()
 
     def process_end_of_measurement(self):
         nominal_used, tol_used_um = self.state.snapshot_nominal_tol()
@@ -390,8 +381,8 @@ class ThicknessProcessor(object):
             t = self.state.timestamps_list
             y = self.state.thickness_values
             m = len(t)
-            i_lo = int(m * self.cfg.TRIM_LO)
-            i_hi = int(m * self.cfg.TRIM_HI)
+            i_lo = int(m * Cfg.TRIM_LO)
+            i_hi = int(m * Cfg.TRIM_HI)
 
             if i_hi - i_lo >= 2:
                 t_trim = t[i_lo:i_hi]
@@ -409,12 +400,12 @@ class ThicknessProcessor(object):
             else:
                 raw_trim_rate_hz = 0.0
 
-            if len(t_trim) > self.cfg.TARGET_POINTS:
+            if len(t_trim) > Cfg.TARGET_POINTS:
                 avg_t, avg_y = [], []
                 n = len(t_trim)
-                for i in range(self.cfg.TARGET_POINTS):
-                    s = (i * n) // self.cfg.TARGET_POINTS
-                    e = ((i + 1) * n) // self.cfg.TARGET_POINTS
+                for i in range(Cfg.TARGET_POINTS):
+                    s = (i * n) // Cfg.TARGET_POINTS
+                    e = ((i + 1) * n) // Cfg.TARGET_POINTS
                     if e <= s:
                         continue
                     seg_t = t_trim[s:e]
@@ -445,16 +436,16 @@ class ThicknessProcessor(object):
                 conicity_delta_mm = float(last_mean_mm - first_mean_mm)
                 conicity_signed_um = conicity_delta_mm * 1000.0
                 conicity_um = abs(conicity_signed_um)
-                conicity_span_mm = float(self.cfg.AXIAL_SPAN_MM)
+                conicity_span_mm = float(Cfg.AXIAL_SPAN_MM)
 
             ok_nominal = (abs(mean_err_um) <= tol_used_um) if mean_err_um is not None else False
-            ok_p2p = (p2p_um is not None and p2p_um <= self.cfg.P2P_THRESH_UM)
+            ok_p2p = (p2p_um is not None and p2p_um <= Cfg.P2P_THRESH_UM)
 
             # Conicity OK if within threshold (or if conicity couldn't be computed for this pass)
             if conicity_signed_um is None:
                 ok_conicity = True
             else:
-                ok_conicity = (abs(conicity_signed_um) <= self.cfg.CONICITY_THRESH_UM)
+                ok_conicity = (abs(conicity_signed_um) <= Cfg.CONICITY_THRESH_UM)
 
             status = "תקין" if (ok_nominal and ok_conicity) else "פסול"
             overall_ok = (status == "תקין")
@@ -463,21 +454,10 @@ class ThicknessProcessor(object):
             if not overall_ok:
                 if mean_err_um is not None and tol_used_um is not None and abs(mean_err_um) > tol_used_um:
                     fail_reason = "גבוה מהנומינלי" if mean_err_um > 0 else "נמוך מהנומינלי"
-                elif conicity_signed_um is not None and abs(conicity_signed_um) > float(self.cfg.CONICITY_THRESH_UM):
+                elif conicity_signed_um is not None and abs(conicity_signed_um) > float(Cfg.CONICITY_THRESH_UM):
                     fail_reason = "קוניות גבוהה"
                 else:
                     fail_reason = None
-
-            # PLC verdict for register 5 (the main app sends it via RegsToPlc; this module never writes the PLC):
-            #   1 = OK, 2 = thickness below nominal, 3 = thickness above nominal, 4 = conicity too high
-            if overall_ok:
-                plc_code = 1
-            elif mean_err_um is not None and tol_used_um is not None and abs(mean_err_um) > tol_used_um:
-                plc_code = 3 if mean_err_um > 0 else 2
-            elif conicity_signed_um is not None and abs(conicity_signed_um) > float(self.cfg.CONICITY_THRESH_UM):
-                plc_code = 4
-            else:
-                plc_code = 2
 
             p = {
                 "raw_t": raw_t, "raw_y": raw_y,
@@ -491,7 +471,7 @@ class ThicknessProcessor(object):
                 "conicity_um": conicity_um,
                 "conicity_delta_mm": conicity_delta_mm,
                 "conicity_span_mm": conicity_span_mm,
-                "conicity_thresh_um": float(self.cfg.CONICITY_THRESH_UM),
+                "conicity_thresh_um": float(Cfg.CONICITY_THRESH_UM),
                 "status": status,
                 "ok_nominal": ok_nominal,
                 "ok_p2p": ok_p2p,
@@ -502,7 +482,6 @@ class ThicknessProcessor(object):
                 "raw_trim_rate_hz": float(raw_trim_rate_hz),
                 "overall_ok": overall_ok,
                 "fail_reason": fail_reason,
-                "plc_code": plc_code,
 
             }
 
@@ -527,20 +506,14 @@ class ThicknessProcessor(object):
 # =========================
 class ThicknessModule(object):
     """Convenience wrapper to start/stop readers+processor without the built-in tkinter UI."""
-
-    def __init__(self, config_path: str | None = None):
-        if config_path is None:
-            config_path = str(Path(__file__).parent / "config" / "config457_thk.json")
-        self.config_path = config_path
-        cfg_dict = load_config_json(config_path)
-        self.cfg = ThicknessConfig(cfg_dict)
-        self.state = ThicknessRuntimeState(self.cfg)
+    def __init__(self, config_path: str | None = None, get_job_limits=None):
+        self.state = ThicknessRuntimeState()
+        self.get_job_limits = get_job_limits  # optional () -> (min_mm, max_mm) for job overrides when running under T3
         self.readers = []
-        for name, info in self.cfg.SENSORS.items():
-            r = SensorReader(self.cfg, self.state, name, info["port"])
+        for name, info in Cfg.SENSORS.items():
+            r = SensorReader(self.state, name, info["port"])
             self.readers.append(r)
-        self.proc = ThicknessProcessor(self.cfg, self.state)
-        self._last_reported_pass = 0
+        self.proc = ThicknessProcessor(self.state, get_job_limits=get_job_limits)
 
     def start(self):
         for r in self.readers:
@@ -559,108 +532,6 @@ class ThicknessModule(object):
                 self.proc.process_end_of_measurement()
             except Exception:
                 pass
-
-    def poll_new_result_code(self):
-        """Return the PLC verdict code (1/2/3/4) for a newly-finished pass, or None if none since the last call."""
-        with self.state.lock:
-            n = len(self.state.passes)
-            if n <= self._last_reported_pass:
-                return None
-            self._last_reported_pass = n
-            return int(self.state.passes[-1].get("plc_code", 0))
-
-    # =====================================================================
-    # Calibration API (two precision gauges of known thickness).
-    # Motion is driven externally (PLC/HMI); these methods only measure & fit.
-    # =====================================================================
-    def measure_gauge(self, window_sec: float | None = None):
-        """Static measurement of a calibration gauge currently sitting between the sensors.
-
-        Collects RAW thickness (uncalibrated) for a fixed time window, then returns
-        a robust summary. Used once per gauge during a calibration sequence.
-
-        Returns dict: {ok, reason, n, raw_median_mm, std_um}.
-        """
-        win = float(window_sec) if window_sec else float(self.cfg.CAL_WINDOW_SEC)
-        self.state.reset_pass()            # make sure we are not mid-part
-        self.state.cal_begin_collect()
-        time.sleep(max(0.5, win))
-        data = self.state.cal_end_collect()
-
-        if len(data) < 5:
-            return {"ok": False, "reason": "too few samples", "n": len(data),
-                    "raw_median_mm": None, "std_um": None}
-
-        arr = np.array(data, dtype=float)
-        med = float(np.median(arr))
-        std_um = float(np.std(arr) * 1000.0)
-        ok = std_um <= float(self.cfg.CAL_STABILITY_MAX_STD_UM)
-        return {"ok": ok, "reason": ("" if ok else "unstable (std too high)"),
-                "n": len(data), "raw_median_mm": med, "std_um": std_um}
-
-    def compute_and_apply_calibration(self, raw_g1_mm, raw_g2_mm):
-        """Two-point linear fit from the two gauge raw readings.
-
-        Pairs (raw_g1 -> CAL_GAUGE_1_MM) and (raw_g2 -> CAL_GAUGE_2_MM), solves
-        thickness_corrected = a*raw + b, validates the gain bounds, and on success
-        applies it live and persists it to the config JSON.
-
-        Returns (ok: bool, info: dict{a, b, reason}).
-        """
-        info = {"a": None, "b": None, "reason": ""}
-        k1, k2 = self.cfg.CAL_GAUGE_1_MM, self.cfg.CAL_GAUGE_2_MM
-        if k1 is None or k2 is None:
-            info["reason"] = "gauge known values not configured"
-            return False, info
-        if raw_g1_mm is None or raw_g2_mm is None:
-            info["reason"] = "missing gauge measurement"
-            return False, info
-
-        denom = (raw_g2_mm - raw_g1_mm)
-        if abs(denom) < 1e-6:
-            info["reason"] = "gauge raw readings identical (cannot fit gain)"
-            return False, info
-
-        a = (k2 - k1) / denom
-        b = k1 - a * raw_g1_mm
-        info["a"], info["b"] = a, b
-
-        if not (self.cfg.CAL_GAIN_MIN <= a <= self.cfg.CAL_GAIN_MAX):
-            info["reason"] = f"gain {a:.4f} out of bounds [{self.cfg.CAL_GAIN_MIN}, {self.cfg.CAL_GAIN_MAX}]"
-            return False, info
-
-        # Apply live and remember on the loaded cfg, then persist.
-        self.state.set_calibration(a, b)
-        self.cfg.CAL_A, self.cfg.CAL_B = a, b
-        self._save_calibration(a, b, raw_g1_mm, raw_g2_mm)
-        info["reason"] = "ok"
-        return True, info
-
-    def get_calibration(self):
-        """Return the currently active calibration {a, b}."""
-        with self.state.cal_lock:
-            return {"a": float(self.state.cal_a), "b": float(self.state.cal_b)}
-
-    def _save_calibration(self, a, b, raw_g1, raw_g2):
-        """Persist calibration results into the 'calibration' block of the config JSON,
-        preserving every other key. Failures here never crash the run."""
-        try:
-            try:
-                data = load_config_json(self.config_path)
-            except Exception:
-                data = {}
-            cal = data.get("calibration", {}) or {}
-            cal["a"] = float(a)
-            cal["b"] = float(b)
-            cal["raw_g1_mm"] = float(raw_g1)
-            cal["raw_g2_mm"] = float(raw_g2)
-            cal["last_calibration_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            data["calibration"] = cal
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
 
     # --- UI-facing API (image only) ---
     def get_display_image(self, last_n: int = 3, size_px=(420, 550)):
@@ -685,18 +556,7 @@ def _safe_float_list(v):
         return []
 
 def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
-    """
-    What the Main UI needs (minimal, operator-friendly):
-      - profile_t: list[float] length ~20  (time axis)
-      - profile_th_mm: list[float] length ~20 (thickness axis)
-      - mean_thickness_mm
-      - mean_err_um
-      - status ("תקין"/"פסול") + ok flags
-      - nominal_used, tol_used_um
-    Strategy:
-      - Use the last pass as reference for t-axis.
-      - Average last_n passes on thickness vs time (interpolate if needed).
-    """
+
     with state.lock:
         passes = list(state.passes[-max(1, int(last_n)):]) if state.passes else []
 
@@ -714,7 +574,7 @@ def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
             "tol_used_um": tol,
             "conicity_signed_um": None,
         "p2p_um": None,
-            "conicity_thresh_um": float(getattr(state.cfg, "CONICITY_THRESH_UM", 5.0)),
+            "conicity_thresh_um": float(getattr(Cfg, "CONICITY_THRESH_UM", 5.0)),
         }
 
     ref = passes[-1]
@@ -760,7 +620,7 @@ def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
         "nominal_used": nominal_used,
         "tol_used_um": tol_used_um,
         "conicity_signed_um": float(ref.get("conicity_signed_um")) if ref.get("conicity_signed_um") is not None else None,
-        "conicity_thresh_um": float(ref.get("conicity_thresh_um", getattr(state.cfg, "CONICITY_THRESH_UM", 5.0))),
+        "conicity_thresh_um": float(ref.get("conicity_thresh_um", getattr(Cfg, "CONICITY_THRESH_UM", 5.0))),
         "p2p_um": (float(ref.get("p2p_um")) if ref.get("p2p_um") is not None else None),
         "overall_ok": ref.get("overall_ok", None),
         "fail_reason": ref.get("fail_reason", None),
@@ -1062,9 +922,9 @@ def render_thickness_panel_pil(state: ThicknessRuntimeState, last_n: int = 3, si
         icon_sz = 22
 
         if i == 0:
-            ico = _load_icon_png("images457/icons/parallel.png", icon_sz)
+            ico = _load_icon_png("icons\\parallel.png", icon_sz)
         elif i == 1:
-            ico = _load_icon_png("images457/icons/cone.png", icon_sz)
+            ico = _load_icon_png("icons\\cone.png", icon_sz)
         else:
             ico = None
 
