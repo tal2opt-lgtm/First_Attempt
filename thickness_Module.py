@@ -231,6 +231,9 @@ class ThicknessRuntimeState(object):
 
         self._last_live_push = 0.0
 
+        # Rolling index for the LAST_10/ raw-profile PNG snapshots (1..10, wraps).
+        self.pass_image_index = 0
+
     def reset_pass(self):
         self.object_in_measurement = False
         self.valid_measurement_detected = False
@@ -243,6 +246,61 @@ class ThicknessRuntimeState(object):
     def snapshot_nominal_tol(self):
         with self.nominal_lock:
             return float(self.nominal_thickness_mm), float(self.tol_um)
+
+_LAST_10_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LAST_10")
+
+def _save_raw_profile_png(p: dict, file_index: int):
+    """Save a PNG of the raw (un-binned) thickness profile of a finished pass
+    into LAST_10/pass_{file_index:02d}.png. file_index is 1..10 and wraps.
+    Error-vs-nominal in µm on the Y axis, with the tolerance band shaded -
+    same style as Thck_Meas_V8 RAW view."""
+    raw_t = p.get("raw_t") or []
+    raw_y = p.get("raw_y") or []
+    if not raw_t or not raw_y:
+        return
+
+    nominal = float(p.get("nominal_used") or 0.0)
+    tol_um = float(p.get("tol_used_um") or 0.0)
+    status = p.get("status") or ""
+    mean_mm = p.get("mean_thickness")
+
+    os.makedirs(_LAST_10_DIR, exist_ok=True)
+
+    t = np.asarray(raw_t, dtype=float)
+    y = np.asarray(raw_y, dtype=float)
+    err_um = (y - nominal) * 1000.0
+
+    fig = Figure(figsize=(6.4, 3.6), dpi=100)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+
+    if tol_um > 0:
+        ax.axhspan(-tol_um, +tol_um, alpha=0.18, color="green")
+        ax.axhline(+tol_um, lw=1.0, linestyle="--", color="gray")
+        ax.axhline(-tol_um, lw=1.0, linestyle="--", color="gray")
+    ax.axhline(0, lw=1.2, color="black")
+
+    ax.plot(t, err_um, "-", lw=0.9, alpha=0.45, color="blue")
+    if tol_um > 0:
+        bad = np.abs(err_um) > tol_um
+        if np.any(bad):
+            ax.plot(t[bad], err_um[bad], "o", ms=2.8, color="red")
+
+    title = f"#{file_index:02d}  {status}"
+    if mean_mm is not None:
+        title += f"   mean={mean_mm:.4f} mm   (nom={nominal:.4f} mm, tol=±{tol_um:.1f}µm)"
+    ax.set_title(title)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Error vs nominal [µm]")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+
+    out_path = os.path.join(_LAST_10_DIR, f"pass_{file_index:02d}.png")
+    try:
+        canvas.print_png(out_path)
+    except Exception:
+        pass
+
 
 def setup_socket(port: int, timeout_sec: float):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -502,6 +560,14 @@ class ThicknessProcessor(object):
             try:
                 if mean_err_um is not None:
                     self.state.err_hist_um.append(float(mean_err_um))
+            except Exception:
+                pass
+
+            # Save the raw thickness profile of this pass to LAST_10/pass_NN.png.
+            # The index rotates 1..10 so the 11th pass overwrites the 1st.
+            try:
+                self.state.pass_image_index = (self.state.pass_image_index % 10) + 1
+                _save_raw_profile_png(p, self.state.pass_image_index)
             except Exception:
                 pass
 
