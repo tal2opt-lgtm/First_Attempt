@@ -21,6 +21,11 @@ import  mv457_MachineVision as mv
 from pyModbusTCP.client import ModbusClient
 
 # ----------------------------
+# PLC register map (thickness)
+# ----------------------------
+THK_VERDICT_REG = 5  # PC -> PLC : thickness verdict 0-none 1-OK 2-below nominal 3-above nominal 4-conicity too high
+
+# ----------------------------
 # Config (global variables)
 # ----------------------------
 class Cfg_:
@@ -326,6 +331,10 @@ def T3_thickness():
     while not Job_settings.stop_event.is_set():
         try:
                 Job_settings.pil3, Job_settings.thk_mean_mm, Job_settings.thk_p2p_um, Job_settings.thk_conicity_um = ThckModule.get_ui_packet(last_n=3, size_px=(420, 900))
+                # Forward the thickness verdict to PLC reg 5, same way T2 reports the image verdict to reg 4.
+                verdict = ThckModule.poll_new_verdict()
+                if verdict is not None:
+                    RegsToPlc[THK_VERDICT_REG] = verdict
         except Exception as e:
             Job_settings.txt3 = f"THK update error: {e}"
 
@@ -407,7 +416,7 @@ def T4_plc_flush():
         ##RegsToPlc[2]: 1- turn on green light 2- turn off green light
         ##RegsToPlc[3]: 1- turn on white light 2- turn off white light
         ##RegsToPlc[4]: 3- Image analysis OK 4- Image analysis NOT OK
-        ##RegsToPlc[5]: 2- thickness detect OK 3-thickness detect not OK
+        ##RegsToPlc[5]: thickness verdict 0-none 1-OK 2-below nominal 3-above nominal 4-conicity too high
 
 
 def T4_plc_flush_1():
@@ -499,7 +508,7 @@ def T4_plc_flush_1():
         ##RegsToPlc[2]: 1- turn on green light 2- turn off green light
         ##RegsToPlc[3]: 1- turn on white light 2- turn off white light
         ##RegsToPlc[4]: 3- Image analysis OK 4- Image analysis NOT OK
-        ##RegsToPlc[5]: 2- thickness detect OK 3-thickness detect not OK
+        ##RegsToPlc[5]: thickness verdict 0-none 1-OK 2-below nominal 3-above nominal 4-conicity too high
 
 
 

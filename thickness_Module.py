@@ -528,6 +528,20 @@ class ThicknessProcessor(object):
                 else:
                     fail_reason = None
 
+            # PLC verdict code:
+            #   1 = OK
+            #   2 = thickness below nominal
+            #   3 = thickness above nominal
+            #   4 = conicity too high
+            if overall_ok:
+                verdict = 1
+            elif mean_err_um is not None and tol_used_um is not None and abs(mean_err_um) > tol_used_um:
+                verdict = 3 if mean_err_um > 0 else 2
+            elif conicity_signed_um is not None and abs(conicity_signed_um) > float(Cfg.CONICITY_THRESH_UM):
+                verdict = 4
+            else:
+                verdict = 2
+
             p = {
                 "raw_t": raw_t, "raw_y": raw_y,
                 "avg_t": avg_t, "avg_y": avg_y,
@@ -551,6 +565,7 @@ class ThicknessProcessor(object):
                 "raw_trim_rate_hz": float(raw_trim_rate_hz),
                 "overall_ok": overall_ok,
                 "fail_reason": fail_reason,
+                "verdict": verdict,
 
             }
 
@@ -592,6 +607,9 @@ class ThicknessModule(object):
             self.readers.append(r)
         self.proc = ThicknessProcessor(self.state, get_job_limits=get_job_limits)
 
+        # Edge-detect counter so a finished pass reports its verdict to the PLC exactly once.
+        self._last_reported_pass = 0
+
     def start(self):
         for r in self.readers:
             r.start()
@@ -625,6 +643,17 @@ class ThicknessModule(object):
         p2p_um = payload.get("p2p_um", None)
         conicity_um = payload.get("conicity_signed_um", None)
         return img, mean_mm, p2p_um, conicity_um
+
+    # --- PLC-facing API ---
+    def poll_new_verdict(self):
+        """Return the verdict code (1/2/3/4) of the latest finished pass exactly once,
+        then None until the next pass closes. Same pattern as mv.Cfg_mv.sttprog -> reg 4."""
+        with self.state.lock:
+            passes_so_far = len(self.state.passes)
+            if passes_so_far <= self._last_reported_pass:
+                return None
+            self._last_reported_pass = passes_so_far
+            return int(self.state.passes[-1].get("verdict", 0))
 
 def _safe_float_list(v):
     try:
