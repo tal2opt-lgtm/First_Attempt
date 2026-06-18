@@ -308,6 +308,17 @@ class ThicknessProcessor(object):
     def join(self, timeout=None):
         self.thread.join(timeout=timeout)
 
+    def _effective_min_max_mm(self):
+        # Job override (T3) takes precedence; fall back to config bounds.
+        if self.get_job_limits is not None:
+            try:
+                lo, hi = self.get_job_limits()
+                if lo is not None and hi is not None:
+                    return float(lo), float(hi)
+            except Exception:
+                pass
+        return float(Cfg.THICKNESS_MIN), float(Cfg.THICKNESS_MAX)
+
     def run(self):
         while not self.state.stop_event.is_set():
             t_samp = b_samp = None
