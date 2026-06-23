@@ -370,17 +370,22 @@ def _contiguous_true_runs(mask):
 
 
 def _detect_feature_runs(y_arr_mm, median_mm, tol_um):
-    """Return number of contiguous samples groups that deviate strongly from
-    the bulk median. Display-only - the statistics themselves are robust and
-    are NOT computed from a filtered profile. A "feature" is anything more
-    than 3x the user's tolerance band away from the bulk median.
+    """Return (n_runs, n_samples) for contiguous groups that look like a real
+    feature (groove wall / hole edge), NOT noise spikes. A feature has to:
+      - exceed 3x the user's tolerance from the bulk median, AND
+      - persist for at least MIN_RUN consecutive samples.
+    Single-sample noise spikes never qualify. Display-only - the statistics
+    are robust on their own.
     """
+    MIN_RUN = 5
     if tol_um is None or tol_um <= 0 or len(y_arr_mm) == 0:
         return 0, 0
     threshold_mm = 2.0 * float(tol_um) / 1000.0
     outlier = (np.abs(y_arr_mm - median_mm) > threshold_mm).tolist()
     runs = _contiguous_true_runs(outlier)
-    return len(runs), int(sum(outlier))
+    long_runs = [(s, e) for (s, e) in runs if (e - s + 1) >= MIN_RUN]
+    n_samples = sum(e - s + 1 for (s, e) in long_runs)
+    return len(long_runs), int(n_samples)
 
 
 def _split_at_time_gaps(t, y, gap_factor=4.0):
@@ -917,8 +922,17 @@ def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
 # Rendering API (UI should receive ONLY images)
 # =========================
 
-def _profile_plot_pil(profile_t, profile_th_mm, nominal_mm=None, tol_um=None, size_px=(420, 250), feature_text=""):
-    """Render the thickness profile to a PIL RGB image (headless)."""
+def _profile_plot_pil(profile_t, profile_th_mm, nominal_mm=None, tol_um=None,
+                      median_mm=None, size_px=(420, 250), feature_text=""):
+    """Render the thickness profile to a PIL RGB image (headless).
+
+    Visual conventions:
+      - Bulk samples (within 2x tol of the bulk median): blue line.
+      - Outlier samples (> 2x tol from median): red dots overlay.
+      - Bulk median: solid green horizontal line ("the answer").
+      - Nominal: solid gray line; tolerance band: dashed gray lines.
+      - Y-axis: nominal +/- 3x tol so a 15um wall stays inside the frame.
+    """
     w_px, h_px = size_px
     dpi = 100
     fig_w = max(1.0, float(w_px) / dpi)
@@ -931,17 +945,43 @@ def _profile_plot_pil(profile_t, profile_th_mm, nominal_mm=None, tol_um=None, si
 
     if profile_t and profile_th_mm and len(profile_t) == len(profile_th_mm):
         t_plot, y_plot = _split_at_time_gaps(profile_t, profile_th_mm)
-        ax.plot(t_plot, y_plot, marker="o", markersize=3, linewidth=1.2)
+        ax.plot(t_plot, y_plot, marker="o", markersize=3, linewidth=1.2, color="#1f77b4")
+
+        # Outlier overlay (red dots). Anchor the band on the bulk median;
+        # fall back to nominal if the renderer was called without a median.
+        if tol_um is not None:
+            try:
+                tol_mm = float(tol_um) / 1000.0
+                anchor_mm = (float(median_mm) if median_mm is not None
+                             else (float(nominal_mm) if nominal_mm is not None else None))
+                if anchor_mm is not None:
+                    t_arr = np.asarray(profile_t, dtype=float)
+                    y_arr = np.asarray(profile_th_mm, dtype=float)
+                    bad = np.abs(y_arr - anchor_mm) > 2.0 * tol_mm
+                    if np.any(bad):
+                        ax.plot(t_arr[bad], y_arr[bad], "o", ms=3.5,
+                                color="#c0392b", zorder=5)
+            except Exception:
+                pass
+
         if nominal_mm is not None and tol_um is not None:
             try:
                 tol_mm = float(tol_um) / 1000.0
                 nom = float(nominal_mm)
-                ax.axhline(nom, linewidth=1.0)
-                ax.axhline(nom + tol_mm, linestyle="--", linewidth=0.8)
-                ax.axhline(nom - tol_mm, linestyle="--", linewidth=0.8)
-                ax.set_ylim(nom - 1.5 * tol_mm, nom + 1.5 * tol_mm)
+                ax.axhline(nom, linewidth=1.0, color="#666666")
+                ax.axhline(nom + tol_mm, linestyle="--", linewidth=0.8, color="#999999")
+                ax.axhline(nom - tol_mm, linestyle="--", linewidth=0.8, color="#999999")
+                ax.set_ylim(nom - 3.0 * tol_mm, nom + 3.0 * tol_mm)
             except Exception:
                 pass
+
+        if median_mm is not None:
+            try:
+                ax.axhline(float(median_mm), linewidth=1.2, color="#27ae60",
+                           label="bulk median")
+            except Exception:
+                pass
+
         if feature_text:
             ax.text(0.02, 0.97, feature_text, transform=ax.transAxes,
                     ha="left", va="top", fontsize=9, color="#a04000",
@@ -1256,6 +1296,7 @@ def render_thickness_panel_pil(state: ThicknessRuntimeState, last_n: int = 3, si
         payload.get("profile_th_mm", []),
         nominal_mm=payload.get("nominal_used", None),
         tol_um=payload.get("tol_used_um", None),
+        median_mm=payload.get("mean_thickness_mm", None),
         size_px=(W - 2 * pad, 250),
         feature_text=("Feature detected" if payload.get("feature_rejection_used", False) else ""),
     )
