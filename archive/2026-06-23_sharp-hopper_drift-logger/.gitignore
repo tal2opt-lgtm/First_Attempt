@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+dev_img/
+results/
+native_img/
+capture/
+drift_logs/
+*.log
+.vscode/
+.idea/
+*.swp
+.DS_Store
