@@ -1,58 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Long-duration thickness DRIFT logger.  (v2 - per-sensor std)
-============================================================
+Thickness DRIFT logger (remote-control) - v2: per-sensor std.
 
-What's new in v2
-----------------
 In addition to the std of the combined THICKNESS, every sample now also records
 the standard deviation of EACH sensor on its own (top_std_um / bot_std_um). This
 lets you study how each head behaves independently - a noisy or drifting single
-sensor is now visible directly instead of being hidden inside the combined
-number. The per-sensor noise is written to the CSV, printed on the console line,
+sensor is visible directly instead of being hidden inside the combined number.
+The per-sensor noise is written to the CSV, printed on the console line,
 summarised at the end of the run, and annotated on the per-sensor plot panel.
-
-
-Purpose
--------
-Park a *fixed* reference object (ideally a calibrated gauge block) between the
-two thickness sensors and let this script run for hours. It samples the
-thickness at a steady interval and writes every reading to a CSV, so you can
-later plot thickness-vs-time and see how the measurement drifts as the room
-lighting, temperature and other ambient conditions change over the day.
-
-What it does
-------------
-* Reuses the production module (`thickness_Module_V3_w.ThicknessModule`) WITHOUT
-  touching it. It starts only the sensor readers and reads each sensor's stream
-  directly, then applies the module's calibration (`apply_calibration`).
-* Every SAMPLE_INTERVAL_SEC it captures a short stable window, records the
-  calibrated thickness, the raw thickness, the window std (noise), and the
-  signed deviation from the nominal value. The window is measured per sensor and
-  combined (median TOP + median BOTTOM), bypassing the strict TOP/BOTTOM time
-  pairing - which is unnecessary for a static object and drifts apart over long
-  continuous runs.
-* DRIFT itself is NOT alerted on - that is exactly the phenomenon we want to
-  observe in the graph. The only alert is a sanity check: if a single reading
-  deviates from the NOMINAL value by more than ALERT_DEVIATION_UM, it is flagged
-  in the CSV and printed to the console (the run keeps going).
-* Writes the CSV incrementally (flushed every row) so hours of data survive a
-  crash or a power loss.
-* Refreshes a thickness-vs-time PNG every PLOT_REFRESH_EVERY samples, so you can
-  peek at the trend mid-run, and writes a final plot + summary at the end.
-* Optional hooks (read_temperature / read_lux) are stubbed out so an ambient
-  sensor can be wired in later and logged on the same row.
-* Remote monitoring (optional): set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID to get
-  a periodic "still alive" heartbeat to your phone plus an immediate alert if a
-  sensor goes silent or readings stall (and a recovery message). A human-readable
-  status.txt is always written regardless, for any remote-access method.
-
-Run
----
-    python thickness_drift_logger.py
-
-Stop any time with Ctrl+C - the CSV, the plot and the summary are finalized on
-exit.
 """
 
 import os
@@ -71,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from thickness_Module_V3_w import ThicknessModule
+import thickness_Module_457 as thck
 
 
 # =============================================================================
@@ -80,7 +35,7 @@ from thickness_Module_V3_w import ThicknessModule
 
 # Nominal thickness of the measured object [mm]. CHANGE THIS when you swap the
 # reference object. Kept hard-coded on purpose so it is trivial to update.
-NOMINAL_THICKNESS_MM = 5.000
+NOMINAL_THICKNESS_MM = 2.000
 
 # A single reading deviating from NOMINAL by more than this raises an alert.
 # This is a sanity flag (vibration / part moved / bad reading), NOT a drift alarm.
@@ -94,6 +49,10 @@ SAMPLE_INTERVAL_SEC = 10.0
 # Averaging window per sample [s]. Each logged value is the median over this
 # window, which suppresses per-frame noise. Keep it well below SAMPLE_INTERVAL_SEC.
 MEASURE_WINDOW_SEC = 2.0
+
+# Per-sample window std [um] above which the window is flagged "unstable" -
+# the value is still logged, just noted as noisy. Used only as a quality flag.
+STABILITY_MAX_STD_UM = 5.0
 
 # Total run length [hours]. Set to None to run until Ctrl+C (good for "let it run
 # overnight"). Set e.g. 1.0 for an hourly test or 24.0 for a daily test.
@@ -121,19 +80,14 @@ BEEP_ON_ALERT = True
 # Output files (timestamped per run so successive runs never overwrite).
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drift_logs")
 
-# Optional: path to the thickness config JSON. None -> module default
-# (config/config457_thk.json).
-CONFIG_PATH = None
-
 # --- Remote monitoring via Telegram (heartbeat + watchdog) -------------------
 # Fill these in to get phone notifications while you are away. Leave empty to
 # disable all remote messaging (the local status file is still written).
 # Setup (~5 min): talk to @BotFather -> /newbot -> copy the token below; then
 # message your new bot once, open
 # https://api.telegram.org/bot<token>/getUpdates and copy the numeric "chat id".
-TELEGRAM_BOT_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
-
+TELEGRAM_BOT_TOKEN = "8383038489:AAFgj0-xjqPtlDwQe4OJWKrCoNHzXHjoyks"
+TELEGRAM_CHAT_ID = "548093301"
 # Send a periodic "still alive" heartbeat every N minutes. If you STOP receiving
 # it, that absence is itself the warning that the run (or the PC) died.
 HEARTBEAT_EVERY_MIN = 60
@@ -159,45 +113,11 @@ STATUS_FILE = os.path.join(OUTPUT_DIR, "status.txt")
 #     proxy already inspects it), but the proper fix above is preferred.
 TELEGRAM_INSECURE_SSL = False
 
-
-# =============================================================================
-# Optional ambient-sensor hooks (wire real sensors in here later)
-# =============================================================================
-def read_temperature_c():
-    """Return ambient temperature in deg C, or None if no sensor is connected.
-
-    Replace the body with a real read (USB/serial/HTTP) to correlate drift with
-    temperature on the same CSV row.
-    """
-    return None
-
-
-def read_lux():
-    """Return ambient light level in lux, or None if no sensor is connected.
-
-    Replace the body with a real read to correlate drift with lighting.
-    """
-    return None
-
-
 # =============================================================================
 # Helpers
 # =============================================================================
-def _measure_window_direct(state, cfg, window_sec):
-    """Measure thickness over a window WITHOUT the TOP/BOTTOM pairing machinery.
+def _measure_window_direct(state, window_sec):
 
-    For a static object, sub-millisecond temporal sync between the two sensors is
-    unnecessary (the object is not moving), and the module's pairing uses a
-    per-sensor virtual clock that slowly drifts apart over a long continuous run -
-    eventually starving the paired buffer ("too few samples") even while both
-    sensors keep reading. Here we instead read each sensor's absolute value
-    stream independently over the window, drop out-of-range (no-object) readings,
-    take the median of each, and compute thickness the same way the processor does:
-        thickness_raw = SENSOR_DISTANCE_MM - (top_abs + bot_abs).
-
-    Returns the same dict shape as ThicknessModule.measure_gauge:
-        {ok, reason, n, raw_median_mm, std_um}.
-    """
     # Mark the newest sample already present on each sensor, then watch only what
     # arrives during the window.
     with state.lock:
@@ -212,7 +132,7 @@ def _measure_window_direct(state, cfg, window_sec):
 
     # Keep only in-range readings (an out-of-range / no-object reading sits at or
     # above the error threshold).
-    thr = float(cfg.ERROR_THRESHOLD_MM)
+    thr = float(thck.Cfg.ERROR_THRESHOLD_MM)
     top = [v for v in top if v < thr]
     bot = [v for v in bot if v < thr]
 
@@ -229,7 +149,7 @@ def _measure_window_direct(state, cfg, window_sec):
     bot_arr = np.array(bot, dtype=float)
     top_med = float(np.median(top_arr))
     bot_med = float(np.median(bot_arr))
-    raw = float(cfg.SENSOR_DISTANCE_MM - (top_med + bot_med))
+    raw = float(thck.Cfg.SENSOR_DISTANCE_MM - (top_med + bot_med))
     # Per-sensor in-window noise: the std of EACH sensor on its own [um]. This
     # exposes how steady each head is by itself, instead of only the combined
     # thickness number - a noisy TOP and a quiet BOTTOM look identical in the
@@ -238,7 +158,7 @@ def _measure_window_direct(state, cfg, window_sec):
     bot_std_um = float(np.std(bot_arr) * 1000.0)
     # Thickness noise combines both sensors' noise in quadrature.
     std_um = float(np.sqrt(np.var(top_arr) + np.var(bot_arr)) * 1000.0)
-    ok = std_um <= float(cfg.CAL_STABILITY_MAX_STD_UM)
+    ok = std_um <= float(STABILITY_MAX_STD_UM)
     return {"ok": ok, "reason": ("" if ok else "unstable (std too high)"),
             "n": n, "raw_median_mm": raw, "std_um": std_um,
             "top_std_um": top_std_um, "bot_std_um": bot_std_um,
@@ -250,12 +170,7 @@ def _measure_window_direct(state, cfg, window_sec):
 # Remote monitoring helpers (Telegram heartbeat + watchdog) + status file
 # =============================================================================
 def _ssl_ctx():
-    """SSL context for the Telegram calls.
 
-    With TELEGRAM_INSECURE_SSL: verification off (works behind a TLS-inspection
-    proxy immediately). Otherwise prefer the OS trust store via 'truststore'
-    (trusts corporate root CAs) and fall back to the default verified context.
-    """
     if TELEGRAM_INSECURE_SSL:
         return ssl._create_unverified_context()
     try:
@@ -337,22 +252,17 @@ def _build_heartbeat_text(rows, t_start, nominal_mm, top_alive, bot_alive, healt
         span_um = (max(thk) - min(thk)) * 1000.0
         lines.append(f"last: {last:.4f} mm (dev {dev:+.2f} um)")
         lines.append(f"total drift span: {span_um:.2f} um")
+        # Per-sensor short-term noise, so the heartbeat shows each head on its own.
+        top_noise = [r["top_std_um"] for r in good if r.get("top_std_um") is not None]
+        bot_noise = [r["bot_std_um"] for r in good if r.get("bot_std_um") is not None]
+        if top_noise and bot_noise:
+            lines.append(f"sensor noise: TOP {np.mean(top_noise):.2f} um | "
+                         f"BOTTOM {np.mean(bot_noise):.2f} um")
     return "\n".join(lines)
 
 
 def _warmup_analysis(rows, nominal_mm):
-    """Detect the end of the warm-up transient and measure the residual drift.
 
-    Warm-up end = earliest time the local drift RATE drops below
-    WARMUP_RATE_UM_PER_H and stays below it for WARMUP_CONFIRM_MIN (rate-based,
-    so it does not assume a fixed final value). The value there is the
-    post-warm-up REFERENCE; the slow ongoing drift is then reported relative to
-    it (rate in um/h, and total um since warm-up).
-
-    Returns None if too little data, else a dict:
-        {warm_done, warm_min, warm_dt, ref_um, ref_mm,
-         residual_rate_um_h, residual_total_um, current_rate_um_h}.
-    """
     good = [r for r in rows if r["thickness_mm"] is not None]
     if len(good) < 20:
         return None
@@ -580,7 +490,8 @@ def main():
     print(f"Plot              : {png_path}")
     print("-" * 60)
 
-    mod = ThicknessModule(CONFIG_PATH)
+    # --- מנוע המדידה: נשענים על thck.Cfg (נטען אוטומטית בייבוא המודול) ---
+    mod = thck.ThicknessModule()
     # Start ONLY the sensor readers, not the ThicknessProcessor: we read each
     # sensor's stream directly (see _measure_window_direct) and must not let the
     # processor drain the sample deques out from under us.
@@ -592,10 +503,9 @@ def main():
     rows = []
     fieldnames = [
         "iso_time", "elapsed_sec",
-        "thickness_mm", "thickness_raw_mm", "deviation_um",
+        "thickness_mm", "deviation_um",
         "top_abs_mm", "bot_abs_mm",
         "window_std_um", "top_std_um", "bot_std_um", "n_samples",
-        "temp_c", "lux",
         "alert", "note",
     ]
 
@@ -628,7 +538,7 @@ def main():
                 now = datetime.now()
                 elapsed = loop_start - t_start
 
-                thickness_mm = thickness_raw_mm = deviation_um = None
+                thickness_mm = deviation_um = None
                 std_um = None
                 top_std_um = bot_std_um = None
                 top_abs_mm = bot_abs_mm = None
@@ -637,7 +547,7 @@ def main():
                 note = ""
 
                 try:
-                    res = _measure_window_direct(mod.state, mod.cfg, MEASURE_WINDOW_SEC)
+                    res = _measure_window_direct(mod.state, MEASURE_WINDOW_SEC)
                     n = int(res.get("n") or 0)
                     std_um = res.get("std_um")
                     top_std_um = res.get("top_std_um")
@@ -650,8 +560,7 @@ def main():
                     if raw is None:
                         note = res.get("reason") or "no reading"
                     else:
-                        thickness_raw_mm = float(raw)
-                        thickness_mm = float(mod.state.apply_calibration(raw))
+                        thickness_mm = float(raw)
                         deviation_um = (thickness_mm - NOMINAL_THICKNESS_MM) * 1000.0
                         if abs(deviation_um) > ALERT_DEVIATION_UM:
                             alert = True
@@ -662,14 +571,10 @@ def main():
                 except Exception as e:
                     note = f"sample error: {e}"
 
-                temp_c = read_temperature_c()
-                lux = read_lux()
-
                 row = {
                     "iso_time": now.strftime("%Y-%m-%dT%H:%M:%S"),
                     "elapsed_sec": f"{elapsed:.1f}",
                     "thickness_mm": "" if thickness_mm is None else f"{thickness_mm:.5f}",
-                    "thickness_raw_mm": "" if thickness_raw_mm is None else f"{thickness_raw_mm:.5f}",
                     "deviation_um": "" if deviation_um is None else f"{deviation_um:+.2f}",
                     "top_abs_mm": "" if top_abs_mm is None else f"{top_abs_mm:.5f}",
                     "bot_abs_mm": "" if bot_abs_mm is None else f"{bot_abs_mm:.5f}",
@@ -677,8 +582,6 @@ def main():
                     "top_std_um": "" if top_std_um is None else f"{top_std_um:.2f}",
                     "bot_std_um": "" if bot_std_um is None else f"{bot_std_um:.2f}",
                     "n_samples": n,
-                    "temp_c": "" if temp_c is None else f"{temp_c:.2f}",
-                    "lux": "" if lux is None else f"{lux:.1f}",
                     "alert": 1 if alert else 0,
                     "note": note,
                 }
@@ -746,7 +649,9 @@ def main():
                     "last_thickness_mm": "n/a" if thickness_mm is None else f"{thickness_mm:.5f}",
                     "last_deviation_um": "n/a" if deviation_um is None else f"{deviation_um:+.2f}",
                     "TOP_sensor": "OK" if top_alive else "SILENT",
+                    "TOP_noise_um": "n/a" if top_std_um is None else f"{top_std_um:.2f}",
                     "BOTTOM_sensor": "OK" if bot_alive else "SILENT",
+                    "BOTTOM_noise_um": "n/a" if bot_std_um is None else f"{bot_std_um:.2f}",
                     "csv": csv_path,
                 })
 
