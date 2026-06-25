@@ -17,7 +17,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import Utils
 import  thickness_Module_457  as thck
-import  mv457_MachineVision as mv
+import  Vision_Module_457 as mv
 from pyModbusTCP.client import ModbusClient
 
 # ----------------------------
