@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import Utils
-import  thickness_Module_457  as thck
+import thickness_Module_457 as thck
 import  Vision_Module_457 as mv
 from pyModbusTCP.client import ModbusClient
 
@@ -291,7 +291,7 @@ def T2():
             state = 1
         if state == 1 and mv.img.status == 4:
             mv.img.img_G=mv.img.last_img ##save current img as Green_img
-            cv2.imwrite(f"native_img\\native_green{mv.Cfg_mv.counter+1}.jpg", mv.img.img_G)
+            cv2.imwrite(f"native_img\\native_green{mv.Cfg_mv.counter+61}.jpg", mv.img.img_G)
             log('green light img is saved')
             #RegsToPlc[2:4] = [1, 2]
             RegsToPlc[2] = 1 ##turn green light off
@@ -299,7 +299,7 @@ def T2():
             state = 2
         if state == 2 and mv.img.WhiteOn == 1:
             mv.img.img_W = mv.img.last_img  ##save current img as White_img
-            cv2.imwrite(f"native_img\\native_white{mv.Cfg_mv.counter +1}.jpg", mv.img.img_W)
+            cv2.imwrite(f"native_img\\native_white{mv.Cfg_mv.counter + 61}.jpg", mv.img.img_W)
             log('white light img is saved')
             with RegsLock:
                 RegsToPlc[1:4]=[1,2,1]
@@ -967,7 +967,7 @@ class EL_UI(tk.Tk):
         btn_opts = dict(padding=(14, 10))
         ttk.Button(bottom, text="Save and exit", command=_close, **btn_opts).pack(side="left", expand=True, fill="x", padx=6)
         ttk.Button(bottom, text="Exit without saving", command=_close, **btn_opts).pack(side="left", expand=True, fill="x", padx=6)
-        ttk.Button(bottom, text="Resolution Calibration", command=mv.Image_calibration, **btn_opts).pack(side="left", expand=True, fill="x", padx=6)
+        ttk.Button(bottom, text="Set default", command=_close, **btn_opts).pack(side="left", expand=True, fill="x", padx=6)
 
     def _open_thickness_adjustment_screen(self):
         """Open form to modify all thck.Cfg (config457_thk.json) properties. Save / Reload / Close. Protected by Password from config457.json."""
