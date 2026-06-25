@@ -11,13 +11,14 @@ import threading
 import os
 import pandas as pd
 import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import Utils
-import thickness_Module as thck
-import  mv457_MachineVision as mv
+import thickness_Module_457 as thck
+import  Vision_Module_457 as mv
 from pyModbusTCP.client import ModbusClient
 
 # ----------------------------
@@ -30,7 +31,7 @@ class Cfg_:
 
     def __init__(self):
         self.WorkstationId = ""
-        self.PlcTcpip ="192.168.3.76"
+        self.PlcTcpip ="192.168.3.169"
         self.PlcPort = 502
         self.PlcLiveSignIntervalSeconds = 2.0
         self.SqlNt = ""
@@ -434,7 +435,7 @@ def T4_plc_flush_1():
     LastSentRegs = [0] * 20
 
     client = ModbusClient(
-        host="192.168.3.76",
+        host="192.168.3.169",
         port=Cfg.PlcPort,
         auto_open=False,
         auto_close=False,
@@ -564,6 +565,20 @@ def GetNewJob_OLDREV(value):
     return True, P
 
 
+def GetNewJobTemp(value):
+    print(value)
+    try:
+        Filename = f'{value}.csv'
+        mv.init_system('W:\\MachineVisionTemplates\\' + Filename)
+        return True, value
+    except:
+        print('cannot load workspec')
+        return False, value
+
+
+
+
+
 def GetNewJob(value):
     """Activate new job: resolve order from SQL, update Job_settings, load MV spec, refresh thickness limits. Returns (success, part_name)."""
     value = (value or "").strip()
@@ -663,7 +678,7 @@ class EL_UI(tk.Tk):
 
         self.after(100, self._refresh_from_Job_settings)
 
-    def NewJob(self, title: str = "Settings"):
+    def NewJob(self, title: str = "NEW JOB"):
         # Use separate _newjob_win so New Job dialog is independent of other settings windows
         if getattr(self, "_newjob_win", None) is not None and self._newjob_win.winfo_exists():
             try:
@@ -792,10 +807,10 @@ class EL_UI(tk.Tk):
                 return "break"
 
             # valid only if txt[1:] all digits
-            is_valid = (len(value) > 1 and value[1:].isdigit())
+            is_valid = (len(value) > 1 and value[1:4].isdigit())
 
             if is_valid:
-                success, part_name =     GetNewJob(value)
+                success, part_name =    GetNewJobTemp(value)
                 if success:
                     print("WO number format OK:", value)
                     self.var_order_nbr.set(value)
@@ -1162,6 +1177,7 @@ class EL_UI(tk.Tk):
                 pass
             win.destroy()
             self._modify_settings_win = None
+            canvas.unbind_all("<MouseWheel>")
 
         win.protocol("WM_DELETE_WINDOW", close_win)
 
@@ -1169,11 +1185,33 @@ class EL_UI(tk.Tk):
         bottom_btns = ttk.Frame(win, padding=(12, 0))
         bottom_btns.pack(side="bottom", fill="x", pady=(8, 12))
 
-        container = ttk.Frame(win, padding=12)
-        container.pack(fill="both", expand=True)
+        main_frame = ttk.Frame(win)
+        main_frame.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical",
+                                  command=canvas.yview)
+
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")
+            )
+        )
+
+        canvas.create_window((0, 0),
+                             window=scrollable_frame,
+                             anchor="nw")
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
         # --- Scalars (all 5; empty = None on save) ---
-        scalars_frame = ttk.LabelFrame(container, text="Scalar settings", padding=8)
+        scalars_frame = ttk.LabelFrame(scrollable_frame, text="Scalar settings", padding=8)
         scalars_frame.pack(fill="x", pady=(0, 8))
 
         scalar_vars = {}
@@ -1188,7 +1226,7 @@ class EL_UI(tk.Tk):
         scalars_frame.grid_columnconfigure(1, weight=1)
 
         # --- Cfg (config457.json) ---
-        cfg_frame = ttk.LabelFrame(container, text="Cfg (config457.json)", padding=8)
+        cfg_frame = ttk.LabelFrame(scrollable_frame, text="Cfg (config457.json)", padding=8)
         cfg_frame.pack(fill="x", pady=(0, 8))
 
         cfg_vars = {}
@@ -1207,6 +1245,11 @@ class EL_UI(tk.Tk):
         plc_connected_lbl.grid(row=cfg_row, column=1, sticky="w", pady=2)
         cfg_row += 1
         cfg_frame.grid_columnconfigure(1, weight=1)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         def save_form():
             for key in Job_settings_.JsonKeys:

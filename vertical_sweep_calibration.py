@@ -9,7 +9,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-import thickness_Module as thck
+import thickness_Module_457 as thck
 from pyModbusTCP.client import ModbusClient
 
 
