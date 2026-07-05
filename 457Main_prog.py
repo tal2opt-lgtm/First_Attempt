@@ -11,7 +11,6 @@ import threading
 import os
 import pandas as pd
 import numpy as np
-
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib.figure import Figure
@@ -78,7 +77,16 @@ RegsLock = threading.Lock()
 RegsToPlc = [0] * 20
 RegsTemp = [0] * 20  # last 20 values stored when T4 flushes to PLC
 
-RegsFromPlc = [0] * 40 
+RegsFromPlc = [0] * 40
+
+# --- Thickness calibration PLC handshake registers (adjust indices to match the PLC) ---
+# PLC -> Py  command (read from RegsFromPlc): 0 idle | 1 at gauge 1, measure | 2 at gauge 2, measure (auto-compute after)
+CAL_CMD_REG = 24
+# Py -> PLC  thickness verdict (per part): 0 none | 1 OK | 2 below nominal | 3 above nominal | 4 conicity high
+THK_RESULT_REG = 5
+# Py -> PLC  calibration status (separate register): 0 idle | 1 measuring (do not move) | 2 gauge 1 done (safe to move) | 3 calibration OK | 4 calibration FAIL
+CAL_STAT_REG = 13
+CAL_MEASURING, CAL_G1_DONE, CAL_OK, CAL_FAIL = 1, 2, 3, 4
 
 """
                 ## 0 to 19 Py to PLC
@@ -153,6 +161,15 @@ class Job_settings_():
         self.thk_mean_mm = None
         self.thk_p2p_um = None
         self.thk_conicity_um = None
+
+        # Thickness calibration view (written by T3, read by the UI). Reassigned as a
+        # whole dict on each update so the cross-thread read is always consistent.
+        self.thk_cal = {
+            "active": False, "phase": "idle",
+            "g1_raw_mm": None, "g1_std_um": None,
+            "g2_raw_mm": None, "g2_std_um": None,
+            "a": None, "b_um": None, "message": "",
+        }
 
         self.reload()
 
@@ -324,12 +341,81 @@ def T3_thickness():
     ThckModule = thck.ThicknessModule()
     ThckModule.start()
 
+    last_cal_cmd = None                 # edge-detect the PLC calibration command
+    cal_raw = {"g1": None, "g2": None}  # raw gauge readings collected during a calibration sequence
+
+    def _fresh_cal_view():
+        return {"active": True, "phase": "measuring_g1",
+                "g1_raw_mm": None, "g1_std_um": None,
+                "g2_raw_mm": None, "g2_std_um": None,
+                "a": None, "b_um": None, "message": ""}
+
+    cal_view = dict(Job_settings.thk_cal)
+
+    def _publish_cal(**changes):
+        # Reassign the whole dict so the UI thread always reads a consistent snapshot.
+        cal_view.update(changes)
+        Job_settings.thk_cal = dict(cal_view)
+
     while not Job_settings.stop_event.is_set():
         try:
                 Job_settings.pil3, Job_settings.thk_mean_mm, Job_settings.thk_p2p_um, Job_settings.thk_conicity_um = ThckModule.get_ui_packet(last_n=3, size_px=(420, 900))
-                verdict = ThckModule.poll_new_verdict()
-                if verdict is not None:
-                    RegsToPlc[5] = verdict ## report to plc the thickness verdict
+                # Forward the thickness verdict to PLC reg 5, same way T2 reports the image verdict to reg 4
+                code = ThckModule.poll_new_result_code()
+                if code is not None:
+                    RegsToPlc[THK_RESULT_REG] = code
+                    verdict = {1: 'OK', 2: 'thickness low', 3: 'thickness high', 4: 'conicity high'}.get(code, 'unknown')
+                    log(f'thickness verdict reg5={code} ({verdict})', 'STATUS')
+
+                # --- Thickness calibration handshake with the PLC (edge-triggered) ---
+                # PLC moves to each gauge and signals its position; the code measures and,
+                # after gauge 2, automatically computes/applies and reports the OK/FAIL result.
+                cal_cmd = RegsFromPlc[CAL_CMD_REG]
+                if cal_cmd != last_cal_cmd:
+                    last_cal_cmd = cal_cmd
+                    if cal_cmd in (1, 2):
+                        gauge = "g1" if cal_cmd == 1 else "g2"
+                        if cal_cmd == 1:
+                            cal_view = _fresh_cal_view()   # gauge 1 starts a fresh sequence
+                            Job_settings.thk_cal = dict(cal_view)
+                        else:
+                            _publish_cal(active=True, phase="measuring_g2", message="")
+                        RegsToPlc[CAL_STAT_REG] = CAL_MEASURING  # busy measuring (PLC must not move yet)
+                        log(f'calibration: measuring gauge {gauge[-1]}', 'STATUS')
+                        res = ThckModule.measure_gauge()
+
+                        if not res.get("ok"):
+                            cal_raw[gauge] = None
+                            RegsToPlc[CAL_STAT_REG] = CAL_FAIL  # measurement failed -> abort sequence
+                            _publish_cal(**{f"{gauge}_raw_mm": res.get("raw_median_mm"),
+                                            f"{gauge}_std_um": res.get("std_um"),
+                                            "phase": "done_fail",
+                                            "message": f"gauge {gauge[-1]}: {res.get('reason')}"})
+                            log(f"calibration: gauge {gauge[-1]} measurement failed ({res.get('reason')})", 'WARN')
+                        else:
+                            cal_raw[gauge] = res["raw_median_mm"]
+                            _publish_cal(**{f"{gauge}_raw_mm": res["raw_median_mm"],
+                                            f"{gauge}_std_um": res["std_um"],
+                                            "phase": f"{gauge}_done"})
+                            log(f"calibration: gauge {gauge[-1]} raw={res['raw_median_mm']:.4f}mm std={res['std_um']:.2f}um", 'STATUS')
+
+                            if gauge == "g1":
+                                RegsToPlc[CAL_STAT_REG] = CAL_G1_DONE  # gauge 1 done, safe to move to gauge 2
+                            else:
+                                # Gauge 2 done -> compute & apply automatically, then report the final result.
+                                _publish_cal(phase="computing", message="")
+                                ok, cinfo = ThckModule.compute_and_apply_calibration(cal_raw["g1"], cal_raw["g2"])
+                                if ok:
+                                    RegsToPlc[CAL_STAT_REG] = CAL_OK  # calibration OK
+                                    _publish_cal(phase="done_ok", a=cinfo["a"], b_um=cinfo["b"] * 1000.0, message="")
+                                    log(f"calibration applied: a={cinfo['a']:.4f} b={cinfo['b'] * 1000.0:+.1f}um", 'STATUS')
+                                else:
+                                    RegsToPlc[CAL_STAT_REG] = CAL_FAIL  # calibration FAIL
+                                    _publish_cal(phase="done_fail", message=cinfo.get("reason", ""))
+                                    log(f"calibration failed: {cinfo.get('reason')}", 'WARN')
+                                cal_raw["g1"] = cal_raw["g2"] = None
+                    elif cal_cmd == 0:
+                        RegsToPlc[CAL_STAT_REG] = 0  # back to idle (window keeps showing the last result)
         except Exception as e:
             Job_settings.txt3 = f"THK update error: {e}"
 
@@ -412,6 +498,7 @@ def T4_plc_flush():
         ##RegsToPlc[3]: 1- turn on white light 2- turn off white light
         ##RegsToPlc[4]: 3- Image analysis OK 4- Image analysis NOT OK
         ##RegsToPlc[5]: thickness verdict 0-none 1-OK 2-below nominal 3-above nominal 4-conicity too high
+        ##RegsToPlc[13]: calibration status 0-idle 1-measuring 2-gauge1 done 3-cal OK 4-cal FAIL
 
 
 def T4_plc_flush_1():
@@ -504,6 +591,7 @@ def T4_plc_flush_1():
         ##RegsToPlc[3]: 1- turn on white light 2- turn off white light
         ##RegsToPlc[4]: 3- Image analysis OK 4- Image analysis NOT OK
         ##RegsToPlc[5]: thickness verdict 0-none 1-OK 2-below nominal 3-above nominal 4-conicity too high
+        ##RegsToPlc[13]: calibration status 0-idle 1-measuring 2-gauge1 done 3-cal OK 4-cal FAIL
 
 
 
@@ -576,9 +664,6 @@ def GetNewJobTemp(value):
         return False, value
 
 
-
-
-
 def GetNewJob(value):
     """Activate new job: resolve order from SQL, update Job_settings, load MV spec, refresh thickness limits. Returns (success, part_name)."""
     value = (value or "").strip()
@@ -615,7 +700,7 @@ def GetNewJob(value):
     Job_settings.wo_order_number = value
     Job_settings.wo_part_number = F
 
-    # Save job thickness limits only in config\config457_thk.json (T3 reads from there via get_job_limits)
+    # Save job thickness limits into config\config457_thk.json (thickness_min_mm/thickness_max_mm; read by ThicknessConfig on next T3 start)
     default_min_mm = 0.3
     default_max_mm = 3.0
     try:
@@ -917,7 +1002,6 @@ class EL_UI(tk.Tk):
                 ("time_sync_threshold_sec", "time_sync_threshold_sec"),
                 ("live_update_hz", "live_update_hz"),
                 ("reference_height_mm", "reference_height_mm"),
-                ("sensor_distance_mm", "sensor_distance_mm"),
                 ("error_threshold_mm", "error_threshold_mm"),
                 ("axial_span_mm", "axial_span_mm"),
                 ("thickness_min_mm", "thickness_min_mm"),
@@ -1032,7 +1116,7 @@ class EL_UI(tk.Tk):
                     except ValueError:
                         val = 0
                 elif key_path in ("socket_timeout_sec", "frame_interval_sec", "time_sync_threshold_sec", "reference_height_mm",
-                                  "sensor_distance_mm", "error_threshold_mm", "axial_span_mm", "thickness_min_mm", "thickness_max_mm",
+                                  "error_threshold_mm", "axial_span_mm", "thickness_min_mm", "thickness_max_mm",
                                   "trim_lo", "trim_hi", "p2p_thresh_um", "conicity_thresh_um", "nominal_thickness_mm_default", "tol_um_default"):
                     try:
                         val = float(raw) if raw else 0.0
@@ -1044,7 +1128,7 @@ class EL_UI(tk.Tk):
             os.makedirs(os.path.dirname(ThkConfigPath), exist_ok=True)
             with open(ThkConfigPath, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            # Note: thickness_Module_V3_w no longer exposes a module-level Cfg.
+            # Note: thickness_Module_457 no longer exposes a module-level Cfg.
             # Edits to the JSON take effect on the next run of T3_thickness.
 
         def reload_thk():
@@ -1140,6 +1224,8 @@ class EL_UI(tk.Tk):
         ttk.Button(buttons, text="⚙ NewJob",
                    #command=lambda: self._open_settings_screen("Select Work Order")).pack(side="left", expand=True, fill="x", padx=5)
                    command=lambda: self.NewJob ()).pack(side="left", expand=True,fill="x", padx=5)
+        ttk.Button(buttons, text="Calibration",
+                   command=self._open_view_calibration).pack(side="left", expand=True, fill="x", padx=5)
         ttk.Button(buttons, text="Modify Settings",
                    command=self._open_modify_settings).pack(side="left", expand=True, fill="x", padx=5)
 
@@ -1484,45 +1570,202 @@ class EL_UI(tk.Tk):
             self.plc_icon_lbl.image = tk_img  # keep reference!
             self._plc_last_state = connected
 
-    def _refresh_from_Job_settings(self):
+    # ----------------------------
+    # Thickness calibration window (auto-opens during a calibration sequence)
+    # ----------------------------
+    # phase -> (display text, color). Driven by Job_settings.thk_cal["phase"] (set by T3).
+    _CAL_PHASES = {
+        "measuring_g1": ("מודד מדיד 1…", "#000000"),
+        "g1_done":      ("מדיד 1 נמדד — ממתין למדיד 2", "#000000"),
+        "measuring_g2": ("מודד מדיד 2…", "#000000"),
+        "g2_done":      ("מדיד 2 נמדד — ממתין לחישוב", "#000000"),
+        "computing":    ("מחשב כיול…", "#000000"),
+        "done_ok":      ("כיול הושלם בהצלחה ✓", "#127a1f"),
+        "done_fail":    ("כיול נכשל ✗", "#b00000"),
+        "view":         ("כיול נוכחי", "#000000"),
+        "idle":         ("", "#000000"),
+    }
 
+    def _build_thk_cal_window(self):
+        win = tk.Toplevel(self)
+        self._thk_cal_win = win
+        win.title("Thickness Calibration")
+        win.transient(self)
+        win.resizable(False, False)
 
+        w, h = 460, 320
+        try:
+            self.update_idletasks()
+            x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+            win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
 
-        self.hdr_wo_order_num.config(text=str(getattr(Job_settings, 'wo_order_number', '')))
-        self.hdr_wo_part_num.config(text=str(getattr(Job_settings, 'wo_part_number', '')))
-        self.hdr_wo_order_qty.config(text=str(getattr(Job_settings, 'wo_order_quantity', '')))
-        self.hdr_wo_obj_counter.config(text=str(getattr(Job_settings, 'wo_object_counter', '')))
-
-        self._update_plc_indicator()
-
-        if Job_settings.pil1 is not None and hasattr(self, "info_img_lbl"):
-            Job_settings.img1 = ImageTk.PhotoImage(Job_settings.pil1)
-            self.info_img_lbl.configure(image=Job_settings.img1, text="")
-            self.info_img_lbl.image = Job_settings.img1
-
-        if Job_settings.pil2 is not None and hasattr(self, "analysis_img_lbl"):
-            Job_settings.img2 = ImageTk.PhotoImage(Job_settings.pil2)
-            self.analysis_img_lbl.configure(image=Job_settings.img2)
-            self.analysis_img_lbl.image = Job_settings.img2
-
-        if Job_settings.pil22 is not None and hasattr(self, "analysis_live_img_lbl"):
-            Job_settings.img22 = ImageTk.PhotoImage(Job_settings.pil22)
-            self.analysis_live_img_lbl.configure(image=Job_settings.img22)
-            self.analysis_live_img_lbl.image = Job_settings.img22
-
-        if Job_settings.pil3 is not None and hasattr(self, "thk_img_lbl"):
-            Job_settings.img3 = ImageTk.PhotoImage(Job_settings.pil3)
-            self.thk_img_lbl.configure(image=Job_settings.img3)
-            self.thk_img_lbl.image = Job_settings.img3
-
-        if hasattr(self, 't1_tree'):
+        def _close():
+            # Mark inactive so the refresh loop won't immediately reopen it.
+            cal = dict(getattr(Job_settings, "thk_cal", {}) or {})
+            cal["active"] = False
+            Job_settings.thk_cal = cal
             try:
-                self._update_t1_packjob_view()
+                win.destroy()
             except Exception:
                 pass
+            self._thk_cal_win = None
 
-        # ✅ schedule next refresh
-        self.after(200, self._refresh_from_Job_settings)
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+        container = ttk.Frame(win, padding=14)
+        container.pack(fill="both", expand=True)
+
+        # Big phase/status line
+        self._cal_phase_lbl = ttk.Label(container, text="", font=("Arial", 16, "bold"))
+        self._cal_phase_lbl.pack(anchor="center", pady=(0, 12))
+
+        grid = ttk.LabelFrame(container, text="Measurements", padding=10)
+        grid.pack(fill="x")
+
+        self._cal_g1_var = tk.StringVar(value="—")
+        self._cal_g2_var = tk.StringVar(value="—")
+        self._cal_result_var = tk.StringVar(value="—")
+
+        def _row(parent, r, title, var):
+            ttk.Label(parent, text=title, width=14, anchor="w").grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Label(parent, textvariable=var, font=("Consolas", 12)).grid(row=r, column=1, sticky="w", pady=3)
+
+        _row(grid, 0, "Gauge 1:", self._cal_g1_var)
+        _row(grid, 1, "Gauge 2:", self._cal_g2_var)
+        _row(grid, 2, "Result:", self._cal_result_var)
+        grid.grid_columnconfigure(1, weight=1)
+
+        self._cal_msg_lbl = ttk.Label(container, text="", foreground="#444444", wraplength=420)
+        self._cal_msg_lbl.pack(anchor="w", pady=(10, 0))
+
+        ttk.Button(container, text="Close", command=_close, padding=(14, 8)).pack(side="bottom", pady=(12, 0))
+
+        win.lift()
+
+    def _open_view_calibration(self):
+        """Operator-triggered: read the last saved calibration from JSON, populate the
+        shared view, and open the window. If a calibration sequence later starts on the
+        PLC, the same window will receive the live updates automatically."""
+        path = os.path.join("config", "config457_thk.json")
+        saved = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    saved = (json.load(f) or {}).get("calibration", {}) or {}
+            except Exception:
+                saved = {}
+
+        a = float(saved.get("a", 1.0))
+        b_mm = float(saved.get("b", 0.0))
+        ts = saved.get("last_calibration_iso")
+        view = {
+            "active": False, "phase": "view",
+            "g1_raw_mm": saved.get("raw_g1_mm"), "g1_std_um": None,
+            "g2_raw_mm": saved.get("raw_g2_mm"), "g2_std_um": None,
+            "a": a, "b_um": b_mm * 1000.0,
+            "message": f"Last calibration: {ts}" if ts else "No calibration applied yet (defaults a=1, b=0).",
+        }
+        Job_settings.thk_cal = view
+
+        if getattr(self, "_thk_cal_win", None) is None or not self._thk_cal_win.winfo_exists():
+            self._build_thk_cal_window()
+        self._update_thk_cal_window()
+        try:
+            self._thk_cal_win.lift()
+            self._thk_cal_win.focus_force()
+        except Exception:
+            pass
+
+    def _update_thk_cal_window(self):
+        cal = getattr(Job_settings, "thk_cal", None)
+        if not cal:
+            return
+
+        win = getattr(self, "_thk_cal_win", None)
+        win_open = win is not None and win.winfo_exists()
+
+        # Auto-open only when a calibration sequence is actually running.
+        # View mode (button) opens the window itself before calling here.
+        if not win_open:
+            if cal.get("active"):
+                self._build_thk_cal_window()
+            else:
+                return
+
+        def _fmt_gauge(raw, std):
+            if raw is None:
+                return "—"
+            s = f"{float(raw):.4f} mm"
+            if std is not None:
+                s += f"   (±{float(std):.2f} µm)"
+            return s
+
+        phase = cal.get("phase", "idle")
+        text, color = self._CAL_PHASES.get(phase, ("", "#000000"))
+        self._cal_phase_lbl.config(text=text, foreground=color)
+
+        self._cal_g1_var.set(_fmt_gauge(cal.get("g1_raw_mm"), cal.get("g1_std_um")))
+        self._cal_g2_var.set(_fmt_gauge(cal.get("g2_raw_mm"), cal.get("g2_std_um")))
+
+        a, b_um = cal.get("a"), cal.get("b_um")
+        if a is not None and b_um is not None:
+            self._cal_result_var.set(f"gain a={float(a):.4f}   offset b={float(b_um):+.1f} µm")
+        else:
+            self._cal_result_var.set("—")
+
+        # Tint the message red only on a failure phase; otherwise keep it neutral.
+        msg_color = "#b00000" if cal.get("phase") == "done_fail" else "#444444"
+        self._cal_msg_lbl.config(text=str(cal.get("message") or ""), foreground=msg_color)
+
+    def _refresh_from_Job_settings(self):
+        try:
+            self.hdr_wo_order_num.config(text=str(getattr(Job_settings, 'wo_order_number', '')))
+            self.hdr_wo_part_num.config(text=str(getattr(Job_settings, 'wo_part_number', '')))
+            self.hdr_wo_order_qty.config(text=str(getattr(Job_settings, 'wo_order_quantity', '')))
+            self.hdr_wo_obj_counter.config(text=str(getattr(Job_settings, 'wo_object_counter', '')))
+
+            self._update_plc_indicator()
+
+            # Snapshot each shared PIL once (the producing threads may swap it mid-refresh).
+            pil1 = Job_settings.pil1
+            if pil1 is not None and hasattr(self, "info_img_lbl"):
+                Job_settings.img1 = ImageTk.PhotoImage(pil1)
+                self.info_img_lbl.configure(image=Job_settings.img1, text="")
+                self.info_img_lbl.image = Job_settings.img1
+
+            pil2 = Job_settings.pil2
+            if pil2 is not None and hasattr(self, "analysis_img_lbl"):
+                Job_settings.img2 = ImageTk.PhotoImage(pil2)
+                self.analysis_img_lbl.configure(image=Job_settings.img2)
+                self.analysis_img_lbl.image = Job_settings.img2
+
+            pil22 = Job_settings.pil22
+            if pil22 is not None and hasattr(self, "analysis_live_img_lbl"):
+                Job_settings.img22 = ImageTk.PhotoImage(pil22)
+                self.analysis_live_img_lbl.configure(image=Job_settings.img22)
+                self.analysis_live_img_lbl.image = Job_settings.img22
+
+            pil3 = Job_settings.pil3
+            if pil3 is not None and hasattr(self, "thk_img_lbl"):
+                Job_settings.img3 = ImageTk.PhotoImage(pil3)
+                self.thk_img_lbl.configure(image=Job_settings.img3)
+                self.thk_img_lbl.image = Job_settings.img3
+
+            if hasattr(self, 't1_tree'):
+                try:
+                    self._update_t1_packjob_view()
+                except Exception:
+                    pass
+
+            self._update_thk_cal_window()
+        except Exception as e:
+            log(f"UI refresh error: {e}", "WARN")
+        finally:
+            # Always reschedule, so a single failed frame can never freeze the UI.
+            self.after(200, self._refresh_from_Job_settings)
 
 
 # ----------------------------

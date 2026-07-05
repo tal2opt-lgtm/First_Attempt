@@ -200,7 +200,7 @@ def read_position(module, cfg):
     thr = cfg.ERROR_THRESHOLD_MM
     top_in = top is not None and top < thr
     bot_in = bot is not None and bot < thr
-    thickness = (cfg.SENSOR_DISTANCE_MM - (top + bot)) if (top_in and bot_in) else None
+    thickness = module.state.apply_calibration(top + bot) if (top_in and bot_in) else None
     return {
         "top_mm": top, "bottom_mm": bot, "thickness_mm": thickness,
         "top_in_range": top_in, "bottom_in_range": bot_in,
