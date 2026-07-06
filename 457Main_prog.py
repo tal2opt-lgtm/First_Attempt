@@ -361,11 +361,11 @@ def T3_thickness():
         try:
                 Job_settings.pil3, Job_settings.thk_mean_mm, Job_settings.thk_p2p_um, Job_settings.thk_conicity_um = ThckModule.get_ui_packet(last_n=3, size_px=(420, 900))
                 # Forward the thickness verdict to PLC reg 5, same way T2 reports the image verdict to reg 4
-                code = ThckModule.poll_new_result_code()
-                if code is not None:
-                    RegsToPlc[THK_RESULT_REG] = code
-                    verdict = {1: 'OK', 2: 'thickness low', 3: 'thickness high', 4: 'conicity high'}.get(code, 'unknown')
-                    log(f'thickness verdict reg5={code} ({verdict})', 'STATUS')
+                verdict = ThckModule.poll_new_verdict()
+                if verdict is not None:
+                    RegsToPlc[THK_RESULT_REG] = verdict
+                    verdict_txt = {1: 'OK', 2: 'thickness low', 3: 'thickness high', 4: 'conicity high'}.get(verdict, 'unknown')
+                    log(f'thickness verdict reg5={verdict} ({verdict_txt})', 'STATUS')
 
                 # --- Thickness calibration handshake with the PLC (edge-triggered) ---
                 # PLC moves to each gauge and signals its position; the code measures and,

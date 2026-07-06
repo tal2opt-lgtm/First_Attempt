@@ -204,6 +204,9 @@ class ThicknessRuntimeState(object):
         # Operator-history: last N part mean errors (signed) for bell-curve/gauge.
         self.err_hist_um = deque(maxlen=60)
 
+        # Rotating index (1..10) for the LAST_10/ raw-profile PNG saved per finished pass.
+        self.pass_image_index = 0
+
         self.nominal_lock = threading.Lock()
         self.nominal_thickness_mm = float(cfg.NOMINAL_THICKNESS_MM_DEFAULT)
         self.tol_um = float(cfg.TOL_UM_DEFAULT)
@@ -490,16 +493,19 @@ class ThicknessProcessor(object):
                 else:
                     fail_reason = None
 
-            # PLC verdict for register 5 (the main app sends it via RegsToPlc; this module never writes the PLC):
-            #   1 = OK, 2 = thickness below nominal, 3 = thickness above nominal, 4 = conicity too high
+            # PLC verdict code (the main app sends it via RegsToPlc; this module never writes the PLC):
+            #   1 = OK
+            #   2 = thickness below nominal
+            #   3 = thickness above nominal
+            #   4 = conicity too high
             if overall_ok:
-                plc_code = 1
+                verdict = 1
             elif mean_err_um is not None and tol_used_um is not None and abs(mean_err_um) > tol_used_um:
-                plc_code = 3 if mean_err_um > 0 else 2
+                verdict = 3 if mean_err_um > 0 else 2
             elif conicity_signed_um is not None and abs(conicity_signed_um) > float(self.cfg.CONICITY_THRESH_UM):
-                plc_code = 4
+                verdict = 4
             else:
-                plc_code = 2
+                verdict = 2
 
             p = {
                 "raw_t": raw_t, "raw_y": raw_y,
@@ -524,7 +530,7 @@ class ThicknessProcessor(object):
                 "raw_trim_rate_hz": float(raw_trim_rate_hz),
                 "overall_ok": overall_ok,
                 "fail_reason": fail_reason,
-                "plc_code": plc_code,
+                "verdict": verdict,
 
             }
 
@@ -534,6 +540,14 @@ class ThicknessProcessor(object):
             try:
                 if mean_err_um is not None:
                     self.state.err_hist_um.append(float(mean_err_um))
+            except Exception:
+                pass
+
+            # Save the raw thickness profile of this pass to LAST_10/pass_NN.png.
+            # The index rotates 1..10 so the 11th pass overwrites the 1st.
+            try:
+                self.state.pass_image_index = (self.state.pass_image_index % 10) + 1
+                _save_raw_profile_png(p, self.state.pass_image_index)
             except Exception:
                 pass
 
@@ -582,14 +596,15 @@ class ThicknessModule(object):
             except Exception:
                 pass
 
-    def poll_new_result_code(self):
-        """Return the PLC verdict code (1/2/3/4) for a newly-finished pass, or None if none since the last call."""
+    def poll_new_verdict(self):
+        """Return the verdict code (1/2/3/4) of the latest finished pass exactly once,
+        then None until the next pass closes. Same pattern as mv.Cfg_mv.sttprog -> reg 4."""
         with self.state.lock:
             n = len(self.state.passes)
             if n <= self._last_reported_pass:
                 return None
             self._last_reported_pass = n
-            return int(self.state.passes[-1].get("plc_code", 0))
+            return int(self.state.passes[-1].get("verdict", 0))
 
     # =====================================================================
     # Calibration API (two precision gauges of known thickness).
@@ -856,6 +871,64 @@ def get_display_payload(state: ThicknessRuntimeState, last_n: int = 3):
         "fail_reason": ref.get("fail_reason", None),
 
     }
+
+
+# =========================
+# Per-pass raw-profile snapshots (LAST_10/)
+# =========================
+_LAST_10_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LAST_10")
+
+def _save_raw_profile_png(p: dict, file_index: int):
+    """Save a PNG of the raw (un-binned) thickness profile of a finished pass
+    into LAST_10/pass_{file_index:02d}.png. file_index is 1..10 and wraps.
+    Error-vs-nominal in µm on the Y axis, with the tolerance band shaded -
+    same style as Thck_Meas_V8 RAW view."""
+    raw_t = p.get("raw_t") or []
+    raw_y = p.get("raw_y") or []
+    if not raw_t or not raw_y:
+        return
+
+    nominal = float(p.get("nominal_used") or 0.0)
+    tol_um = float(p.get("tol_used_um") or 0.0)
+    status = p.get("status") or ""
+    mean_mm = p.get("mean_thickness")
+
+    os.makedirs(_LAST_10_DIR, exist_ok=True)
+
+    t = np.asarray(raw_t, dtype=float)
+    y = np.asarray(raw_y, dtype=float)
+    err_um = (y - nominal) * 1000.0
+
+    fig = Figure(figsize=(6.4, 3.6), dpi=100)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+
+    if tol_um > 0:
+        ax.axhspan(-tol_um, +tol_um, alpha=0.18, color="green")
+        ax.axhline(+tol_um, lw=1.0, linestyle="--", color="gray")
+        ax.axhline(-tol_um, lw=1.0, linestyle="--", color="gray")
+    ax.axhline(0, lw=1.2, color="black")
+
+    ax.plot(t, err_um, "-", lw=0.9, alpha=0.45, color="blue")
+    if tol_um > 0:
+        bad = np.abs(err_um) > tol_um
+        if np.any(bad):
+            ax.plot(t[bad], err_um[bad], "o", ms=2.8, color="red")
+
+    title = f"#{file_index:02d}  {status}"
+    if mean_mm is not None:
+        title += f"   mean={mean_mm:.4f} mm   (nom={nominal:.4f} mm, tol=±{tol_um:.1f}µm)"
+    ax.set_title(title)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Error vs nominal [µm]")
+    ax.grid(True, alpha=0.4)
+    fig.tight_layout()
+
+    out_path = os.path.join(_LAST_10_DIR, f"pass_{file_index:02d}.png")
+    try:
+        canvas.print_png(out_path)
+    except Exception:
+        pass
 
 
 # =========================
