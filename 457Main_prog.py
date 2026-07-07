@@ -79,13 +79,18 @@ RegsTemp = [0] * 20  # last 20 values stored when T4 flushes to PLC
 
 RegsFromPlc = [0] * 40
 
-# --- Deferred PC->PLC calibration 'begin' request ---
-# The register map has no PC->PLC "start calibration" register (the calibration
-# command is PLC->PC on reg 24). Until the PLC side assigns one, the on-screen
-# "Start Calibration" button only arms the local sequence. Flip the flag to True
-# and set the real register number once it is defined.
-PLC_CAL_BEGIN_ENABLED = False
-PLC_CAL_BEGIN_REG = 14
+# --- Thickness calibration: M6 horizontal motor register map (0-based) ---
+# The code drives M6 to each Johnson gauge: motion is commanded on reg 6 (write
+# the target POS number) and arrival is read back on reg 24 (== target POS).
+M6_CMD_REG = 6           # PC->PLC : write POS number -> "M6 Go position N"
+M6_STATUS_REG = 24       # PLC->PC : M6 status, == POS number when in position
+POS_GAUGE_1 = 5          # Johnson gauge 1
+POS_GAUGE_2 = 6          # Johnson gauge 2
+POS_MEASURE = 1          # measurement (work) position
+M6_MOVE_TIMEOUT_SEC = 30.0
+
+# Set by T3 at startup so the calibration sequence can reach the thickness module.
+ThckModule = None
 
 """
                 ## 0 to 19 Py to PLC
@@ -431,102 +436,105 @@ def T2():
 
 
 def T3_thickness():
+    global ThckModule
     ThckModule = thck.ThicknessModule()
     ThckModule.start()
 
-    # --- Thickness PLC register map (kept local to this thread; nothing thickness-related lives at module scope) ---
-    # PLC -> Py  command (read from RegsFromPlc): 0 idle | 1 at gauge 1, measure | 2 at gauge 2, measure (auto-compute after)
-    CAL_CMD_REG = 24
-    # Py -> PLC  thickness verdict (per part): 0 none | 1 OK | 2 below nominal | 3 above nominal | 4 conicity high
+    # Py -> PLC thickness verdict (per part): 0 none | 1 OK | 2 below | 3 above | 4 conicity
     THK_RESULT_REG = 5
-    # Py -> PLC  calibration status (separate register): 0 idle | 1 measuring (do not move) | 2 gauge 1 done (safe to move) | 3 calibration OK | 4 calibration FAIL
-    CAL_STAT_REG = 13
-    CAL_MEASURING, CAL_G1_DONE, CAL_OK, CAL_FAIL = 1, 2, 3, 4
-
-    last_cal_cmd = None                 # edge-detect the PLC calibration command
-    cal_raw = {"g1": None, "g2": None}  # raw gauge readings collected during a calibration sequence
-
-    def _fresh_cal_view():
-        return {"active": True, "phase": "measuring_g1",
-                "g1_raw_mm": None, "g1_std_um": None,
-                "g2_raw_mm": None, "g2_std_um": None,
-                "a": None, "b_um": None, "message": ""}
-
-    cal_view = dict(Job_settings.thk_cal)
-
-    def _publish_cal(**changes):
-        # Reassign the whole dict so the UI thread always reads a consistent snapshot.
-        cal_view.update(changes)
-        Job_settings.thk_cal = dict(cal_view)
 
     while not Job_settings.stop_event.is_set():
         try:
                 Job_settings.pil3, Job_settings.thk_mean_mm, Job_settings.thk_p2p_um, Job_settings.thk_conicity_um = ThckModule.get_ui_packet(last_n=3, size_px=(420, 900))
-                # Forward the thickness verdict to PLC reg 5, same way T2 reports the image verdict to reg 4
+                # Forward the thickness verdict to PLC reg 5 (only once work is allowed).
                 verdict = ThckModule.poll_new_verdict()
                 if verdict is not None and CalGate.WorkAllowed:
                     RegsToPlc[THK_RESULT_REG] = verdict
                     verdict_txt = {1: 'OK', 2: 'thickness low', 3: 'thickness high', 4: 'conicity high'}.get(verdict, 'unknown')
                     log(f'thickness verdict reg5={verdict} ({verdict_txt})', 'STATUS')
-
-                # --- Thickness calibration handshake with the PLC (edge-triggered) ---
-                # PLC moves to each gauge and signals its position; the code measures and,
-                # after gauge 2, automatically computes/applies and reports the OK/FAIL result.
-                cal_cmd = RegsFromPlc[CAL_CMD_REG]
-                if cal_cmd != last_cal_cmd:
-                    last_cal_cmd = cal_cmd
-                    if cal_cmd in (1, 2) and CalGate.state != "warmup":
-                        gauge = "g1" if cal_cmd == 1 else "g2"
-                        if cal_cmd == 1:
-                            cal_view = _fresh_cal_view()   # gauge 1 starts a fresh sequence
-                            Job_settings.thk_cal = dict(cal_view)
-                        else:
-                            _publish_cal(active=True, phase="measuring_g2", message="")
-                        RegsToPlc[CAL_STAT_REG] = CAL_MEASURING  # busy measuring (PLC must not move yet)
-                        log(f'calibration: measuring gauge {gauge[-1]}', 'STATUS')
-                        res = ThckModule.measure_gauge()
-
-                        if not res.get("ok"):
-                            cal_raw[gauge] = None
-                            RegsToPlc[CAL_STAT_REG] = CAL_FAIL  # measurement failed -> abort sequence
-                            _publish_cal(**{f"{gauge}_raw_mm": res.get("raw_median_mm"),
-                                            f"{gauge}_std_um": res.get("std_um"),
-                                            "phase": "done_fail",
-                                            "message": f"gauge {gauge[-1]}: {res.get('reason')}"})
-                            log(f"calibration: gauge {gauge[-1]} measurement failed ({res.get('reason')})", 'WARN')
-                            CalGate.CalibrationResult(False)
-                        else:
-                            cal_raw[gauge] = res["raw_median_mm"]
-                            _publish_cal(**{f"{gauge}_raw_mm": res["raw_median_mm"],
-                                            f"{gauge}_std_um": res["std_um"],
-                                            "phase": f"{gauge}_done"})
-                            log(f"calibration: gauge {gauge[-1]} raw={res['raw_median_mm']:.4f}mm std={res['std_um']:.2f}um", 'STATUS')
-
-                            if gauge == "g1":
-                                RegsToPlc[CAL_STAT_REG] = CAL_G1_DONE  # gauge 1 done, safe to move to gauge 2
-                            else:
-                                # Gauge 2 done -> compute & apply automatically, then report the final result.
-                                _publish_cal(phase="computing", message="")
-                                ok, cinfo = ThckModule.compute_and_apply_calibration(cal_raw["g1"], cal_raw["g2"])
-                                if ok:
-                                    RegsToPlc[CAL_STAT_REG] = CAL_OK  # calibration OK
-                                    _publish_cal(phase="done_ok", a=cinfo["a"], b_um=cinfo["b"] * 1000.0, message="")
-                                    log(f"calibration applied: a={cinfo['a']:.4f} b={cinfo['b'] * 1000.0:+.1f}um", 'STATUS')
-                                    CalGate.CalibrationResult(True)
-                                else:
-                                    RegsToPlc[CAL_STAT_REG] = CAL_FAIL  # calibration FAIL
-                                    _publish_cal(phase="done_fail", message=cinfo.get("reason", ""))
-                                    log(f"calibration failed: {cinfo.get('reason')}", 'WARN')
-                                    CalGate.CalibrationResult(False)
-                                cal_raw["g1"] = cal_raw["g2"] = None
-                    elif cal_cmd == 0:
-                        RegsToPlc[CAL_STAT_REG] = 0  # back to idle (window keeps showing the last result)
         except Exception as e:
             Job_settings.txt3 = f"THK update error: {e}"
 
         time.sleep(0.2)
 
     ThckModule.stop()
+
+
+def run_calibration_sequence():
+    """PC-driven calibration: move M6 to each Johnson gauge, measure, fit, then
+    return to the measurement position. Triggered by the 'Start Calibration' button.
+    Motion is commanded on reg 6 (POS number); arrival is read on reg 24 (== POS)."""
+    tm = ThckModule
+    if tm is None:
+        log("calibration: thickness module not ready", "WARN")
+        CalGate.CalibrationResult(False)
+        return
+
+    def _publish(**changes):
+        # Reassign the whole dict so the UI thread reads a consistent snapshot.
+        view = dict(getattr(Job_settings, "thk_cal", {}) or {})
+        view.update(changes)
+        Job_settings.thk_cal = view
+
+    def _go_and_wait(pos, label):
+        with RegsLock:
+            RegsToPlc[M6_CMD_REG] = pos
+        log(f"calibration: M6 -> POS {pos} ({label})", "STATUS")
+        t0 = time.time()
+        while time.time() - t0 < M6_MOVE_TIMEOUT_SEC:
+            if Job_settings.stop_event.is_set():
+                return False
+            if RegsFromPlc[M6_STATUS_REG] == pos:
+                return True
+            time.sleep(0.05)
+        log(f"calibration: TIMEOUT waiting for M6 at POS {pos}", "WARN")
+        return False
+
+    def _fail(msg):
+        _publish(phase="done_fail", message=msg)
+        log(f"calibration failed: {msg}", "WARN")
+        _go_and_wait(POS_MEASURE, "measurement")  # try to return home even on failure
+        CalGate.CalibrationResult(False)
+
+    _publish(active=True, phase="measuring_g1", g1_raw_mm=None, g1_std_um=None,
+             g2_raw_mm=None, g2_std_um=None, a=None, b_um=None, message="")
+
+    # --- Gauge 1 @ POS 5 ---
+    if not _go_and_wait(POS_GAUGE_1, "Johnson 1"):
+        _fail("לא הגיע ל-POS 5 (timeout)")
+        return
+    res1 = tm.measure_gauge()
+    if not res1.get("ok"):
+        _publish(g1_raw_mm=res1.get("raw_median_mm"), g1_std_um=res1.get("std_um"))
+        _fail(f"ג'ונסון 1: {res1.get('reason')}")
+        return
+    _publish(g1_raw_mm=res1["raw_median_mm"], g1_std_um=res1["std_um"], phase="g1_done")
+    log(f"calibration: gauge 1 raw={res1['raw_median_mm']:.4f}mm std={res1['std_um']:.2f}um", "STATUS")
+
+    # --- Gauge 2 @ POS 6 ---
+    _publish(phase="measuring_g2")
+    if not _go_and_wait(POS_GAUGE_2, "Johnson 2"):
+        _fail("לא הגיע ל-POS 6 (timeout)")
+        return
+    res2 = tm.measure_gauge()
+    if not res2.get("ok"):
+        _publish(g2_raw_mm=res2.get("raw_median_mm"), g2_std_um=res2.get("std_um"))
+        _fail(f"ג'ונסון 2: {res2.get('reason')}")
+        return
+    _publish(g2_raw_mm=res2["raw_median_mm"], g2_std_um=res2["std_um"], phase="computing")
+    log(f"calibration: gauge 2 raw={res2['raw_median_mm']:.4f}mm std={res2['std_um']:.2f}um", "STATUS")
+
+    # --- Compute + apply, then return to the measurement position (POS 1) ---
+    ok, info = tm.compute_and_apply_calibration(res1["raw_median_mm"], res2["raw_median_mm"])
+    if ok:
+        _publish(phase="done_ok", a=info["a"], b_um=info["b"] * 1000.0, message="")
+        log(f"calibration applied: a={info['a']:.4f} b={info['b'] * 1000.0:+.1f}um", "STATUS")
+    else:
+        _publish(phase="done_fail", message=info.get("reason", ""))
+        log(f"calibration failed: {info.get('reason')}", "WARN")
+
+    _go_and_wait(POS_MEASURE, "measurement")
+    CalGate.CalibrationResult(ok)
 
 
 def T4_plc_flush():
@@ -1761,24 +1769,16 @@ class EL_UI(tk.Tk):
         win.lift()
 
     def _start_calibration(self):
-        """Operator trigger: begin the calibration sequence (allowed only after warmup)."""
+        """Operator trigger: run the PC-driven calibration sequence (after warmup)."""
         if not CalGate.CanCalibrate():
             messagebox.showinfo("כיול", CalGate.StatusText())
             return
         if not CalGate.BeginCalibration():
             return
-        # Deferred PC->PLC 'begin' request (no such register defined yet).
-        if PLC_CAL_BEGIN_ENABLED:
-            with RegsLock:
-                RegsToPlc[PLC_CAL_BEGIN_REG] = 1
-        # Open the live window; T3 drives it from the reg24/reg13 handshake.
-        view = dict(getattr(Job_settings, "thk_cal", {}) or {})
-        view["active"] = True
-        view["phase"] = "measuring_g1"
-        Job_settings.thk_cal = view
+        # Open the live window; run_calibration_sequence drives M6 + measures + fits.
         if getattr(self, "_thk_cal_win", None) is None or not self._thk_cal_win.winfo_exists():
             self._build_thk_cal_window()
-        self._update_thk_cal_window()
+        threading.Thread(target=run_calibration_sequence, daemon=True).start()
 
     def _open_view_calibration(self):
         """Operator-triggered: read the last saved calibration from JSON, populate the
