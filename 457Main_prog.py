@@ -79,15 +79,6 @@ RegsTemp = [0] * 20  # last 20 values stored when T4 flushes to PLC
 
 RegsFromPlc = [0] * 40
 
-# --- Thickness calibration PLC handshake registers (adjust indices to match the PLC) ---
-# PLC -> Py  command (read from RegsFromPlc): 0 idle | 1 at gauge 1, measure | 2 at gauge 2, measure (auto-compute after)
-CAL_CMD_REG = 24
-# Py -> PLC  thickness verdict (per part): 0 none | 1 OK | 2 below nominal | 3 above nominal | 4 conicity high
-THK_RESULT_REG = 5
-# Py -> PLC  calibration status (separate register): 0 idle | 1 measuring (do not move) | 2 gauge 1 done (safe to move) | 3 calibration OK | 4 calibration FAIL
-CAL_STAT_REG = 13
-CAL_MEASURING, CAL_G1_DONE, CAL_OK, CAL_FAIL = 1, 2, 3, 4
-
 """
                 ## 0 to 19 Py to PLC
                 0:misc instructions  from Py to PLC :{0:null ,1:live signe,2:hold for gage calibration, 3:resume after gage calibration }
@@ -340,6 +331,15 @@ def T2():
 def T3_thickness():
     ThckModule = thck.ThicknessModule()
     ThckModule.start()
+
+    # --- Thickness PLC register map (kept local to this thread; nothing thickness-related lives at module scope) ---
+    # PLC -> Py  command (read from RegsFromPlc): 0 idle | 1 at gauge 1, measure | 2 at gauge 2, measure (auto-compute after)
+    CAL_CMD_REG = 24
+    # Py -> PLC  thickness verdict (per part): 0 none | 1 OK | 2 below nominal | 3 above nominal | 4 conicity high
+    THK_RESULT_REG = 5
+    # Py -> PLC  calibration status (separate register): 0 idle | 1 measuring (do not move) | 2 gauge 1 done (safe to move) | 3 calibration OK | 4 calibration FAIL
+    CAL_STAT_REG = 13
+    CAL_MEASURING, CAL_G1_DONE, CAL_OK, CAL_FAIL = 1, 2, 3, 4
 
     last_cal_cmd = None                 # edge-detect the PLC calibration command
     cal_raw = {"g1": None, "g2": None}  # raw gauge readings collected during a calibration sequence
