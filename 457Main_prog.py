@@ -79,6 +79,14 @@ RegsTemp = [0] * 20  # last 20 values stored when T4 flushes to PLC
 
 RegsFromPlc = [0] * 40
 
+# --- Deferred PC->PLC calibration 'begin' request ---
+# The register map has no PC->PLC "start calibration" register (the calibration
+# command is PLC->PC on reg 24). Until the PLC side assigns one, the on-screen
+# "Start Calibration" button only arms the local sequence. Flip the flag to True
+# and set the real register number once it is defined.
+PLC_CAL_BEGIN_ENABLED = False
+PLC_CAL_BEGIN_REG = 14
+
 """
                 ## 0 to 19 Py to PLC
                 0:misc instructions  from Py to PLC :{0:null ,1:live signe,2:hold for gage calibration, 3:resume after gage calibration }
@@ -195,6 +203,96 @@ Job_settings = Job_settings_()
  
 
 # ----------------------------
+# Startup warmup + calibration gate (T5)
+# ----------------------------
+class StartupCalGate_:
+    """From program start, blocks measurement/verdict for `warmup_minutes`
+    (config457_zeroing.json). After warmup the machine requires a calibration
+    before any work is allowed: the UI shows 'נדרש כיול', the operator presses
+    'Start Calibration', the existing reg24/reg13 sequence runs, and on success
+    work is enabled. Combines the T5 warmup principle with the branch calibration."""
+    ConfigPath = os.path.join("config", "config457_zeroing.json")
+
+    def __init__(self):
+        self.WarmupMinutes = 10.0
+        self._load()
+        self._lock = threading.Lock()
+        self.SessionStart = time.time()
+        self.state = "warmup"          # warmup -> cal_required -> calibrating -> ready ; cal_failed
+        self.last_cal_iso = None
+        self.last_cal_ok = None
+
+    def _load(self):
+        if os.path.isfile(self.ConfigPath):
+            try:
+                with open(self.ConfigPath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.WarmupMinutes = float(data.get("warmup_minutes", self.WarmupMinutes))
+            except Exception:
+                pass
+
+    @property
+    def WorkAllowed(self):
+        return self.state == "ready"
+
+    def WarmupRemainingMin(self):
+        return max(self.WarmupMinutes - (time.time() - self.SessionStart) / 60.0, 0.0)
+
+    def Tick(self):
+        with self._lock:
+            if self.state == "warmup" and self.WarmupRemainingMin() <= 0.0:
+                self.state = "cal_required"
+                log("warmup complete -> calibration required", "STATUS")
+
+    def CanCalibrate(self):
+        return self.state in ("cal_required", "cal_failed")
+
+    def BeginCalibration(self):
+        """Called by the 'Start Calibration' button; valid only after warmup ended."""
+        with self._lock:
+            if self.state in ("cal_required", "cal_failed"):
+                self.state = "calibrating"
+                log("calibration sequence started by operator", "STATUS")
+                return True
+            return False
+
+    def CalibrationResult(self, ok, iso=None):
+        with self._lock:
+            self.last_cal_iso = iso or time.strftime("%Y-%m-%d %H:%M:%S")
+            self.last_cal_ok = bool(ok)
+            self.state = "ready" if ok else "cal_failed"
+            log(f"calibration result: {'OK' if ok else 'FAIL'} at {self.last_cal_iso}", "STATUS")
+
+    def StatusText(self):
+        st = self.state
+        if st == "warmup":
+            return f"חימום — נותרו {self.WarmupRemainingMin():.1f} דק'"
+        if st == "cal_required":
+            return "נדרש כיול"
+        if st == "calibrating":
+            return "כיול בתהליך…"
+        if st == "cal_failed":
+            return "כיול נכשל — נדרש כיול חוזר"
+        return "מוכן לעבודה"
+
+    def LastCalText(self):
+        if self.last_cal_iso is None:
+            return "כיול אחרון: —"
+        verdict = "תקין" if self.last_cal_ok else "פסול"
+        return f"כיול אחרון: {self.last_cal_iso} — {verdict}"
+
+
+CalGate = StartupCalGate_()
+
+
+def T5_startup_gate():
+    """Warmup countdown + state ticking for the calibration gate."""
+    while not Job_settings.stop_event.is_set():
+        CalGate.Tick()
+        time.sleep(1.0)
+
+
+# ----------------------------
 # Random images (PIL only)
 # ----------------------------
 def Random_Image():
@@ -268,6 +366,10 @@ def T2():
 
 
     while not Job_settings.stop_event.is_set():
+        if not CalGate.WorkAllowed:
+            # Warmup / calibration not done yet: no image work.
+            time.sleep(0.05)
+            continue
         mv.img.refresh()
         if time.time()-t1>0.3 and state !=3:
             im2 = to_pil(mv.img.last_img)
@@ -362,7 +464,7 @@ def T3_thickness():
                 Job_settings.pil3, Job_settings.thk_mean_mm, Job_settings.thk_p2p_um, Job_settings.thk_conicity_um = ThckModule.get_ui_packet(last_n=3, size_px=(420, 900))
                 # Forward the thickness verdict to PLC reg 5, same way T2 reports the image verdict to reg 4
                 verdict = ThckModule.poll_new_verdict()
-                if verdict is not None:
+                if verdict is not None and CalGate.WorkAllowed:
                     RegsToPlc[THK_RESULT_REG] = verdict
                     verdict_txt = {1: 'OK', 2: 'thickness low', 3: 'thickness high', 4: 'conicity high'}.get(verdict, 'unknown')
                     log(f'thickness verdict reg5={verdict} ({verdict_txt})', 'STATUS')
@@ -373,7 +475,7 @@ def T3_thickness():
                 cal_cmd = RegsFromPlc[CAL_CMD_REG]
                 if cal_cmd != last_cal_cmd:
                     last_cal_cmd = cal_cmd
-                    if cal_cmd in (1, 2):
+                    if cal_cmd in (1, 2) and CalGate.state != "warmup":
                         gauge = "g1" if cal_cmd == 1 else "g2"
                         if cal_cmd == 1:
                             cal_view = _fresh_cal_view()   # gauge 1 starts a fresh sequence
@@ -392,6 +494,7 @@ def T3_thickness():
                                             "phase": "done_fail",
                                             "message": f"gauge {gauge[-1]}: {res.get('reason')}"})
                             log(f"calibration: gauge {gauge[-1]} measurement failed ({res.get('reason')})", 'WARN')
+                            CalGate.CalibrationResult(False)
                         else:
                             cal_raw[gauge] = res["raw_median_mm"]
                             _publish_cal(**{f"{gauge}_raw_mm": res["raw_median_mm"],
@@ -409,10 +512,12 @@ def T3_thickness():
                                     RegsToPlc[CAL_STAT_REG] = CAL_OK  # calibration OK
                                     _publish_cal(phase="done_ok", a=cinfo["a"], b_um=cinfo["b"] * 1000.0, message="")
                                     log(f"calibration applied: a={cinfo['a']:.4f} b={cinfo['b'] * 1000.0:+.1f}um", 'STATUS')
+                                    CalGate.CalibrationResult(True)
                                 else:
                                     RegsToPlc[CAL_STAT_REG] = CAL_FAIL  # calibration FAIL
                                     _publish_cal(phase="done_fail", message=cinfo.get("reason", ""))
                                     log(f"calibration failed: {cinfo.get('reason')}", 'WARN')
+                                    CalGate.CalibrationResult(False)
                                 cal_raw["g1"] = cal_raw["g2"] = None
                     elif cal_cmd == 0:
                         RegsToPlc[CAL_STAT_REG] = 0  # back to idle (window keeps showing the last result)
@@ -1180,6 +1285,14 @@ class EL_UI(tk.Tk):
             lbl.bind("<Button-1>", lambda e: self.NewJob())
         wo_header.grid_columnconfigure(1, weight=1)
 
+        # Calibration status + last calibration (top of screen)
+        cal_hdr = ttk.Frame(header)
+        cal_hdr.pack(side="left", padx=(24, 0))
+        self.hdr_cal_status = ttk.Label(cal_hdr, text="", font=("Arial", 14, "bold"))
+        self.hdr_cal_status.pack(anchor="w")
+        self.hdr_last_cal = ttk.Label(cal_hdr, text="", font=("Arial", 10))
+        self.hdr_last_cal.pack(anchor="w")
+
         ### Upper Right
         right_bar = ttk.Frame(header)
         right_bar.pack(side="right")
@@ -1226,6 +1339,8 @@ class EL_UI(tk.Tk):
                    command=lambda: self.NewJob ()).pack(side="left", expand=True,fill="x", padx=5)
         ttk.Button(buttons, text="Calibration",
                    command=self._open_view_calibration).pack(side="left", expand=True, fill="x", padx=5)
+        ttk.Button(buttons, text="התחל כיול",
+                   command=self._start_calibration).pack(side="left", expand=True, fill="x", padx=5)
         ttk.Button(buttons, text="Modify Settings",
                    command=self._open_modify_settings).pack(side="left", expand=True, fill="x", padx=5)
 
@@ -1645,6 +1760,26 @@ class EL_UI(tk.Tk):
 
         win.lift()
 
+    def _start_calibration(self):
+        """Operator trigger: begin the calibration sequence (allowed only after warmup)."""
+        if not CalGate.CanCalibrate():
+            messagebox.showinfo("כיול", CalGate.StatusText())
+            return
+        if not CalGate.BeginCalibration():
+            return
+        # Deferred PC->PLC 'begin' request (no such register defined yet).
+        if PLC_CAL_BEGIN_ENABLED:
+            with RegsLock:
+                RegsToPlc[PLC_CAL_BEGIN_REG] = 1
+        # Open the live window; T3 drives it from the reg24/reg13 handshake.
+        view = dict(getattr(Job_settings, "thk_cal", {}) or {})
+        view["active"] = True
+        view["phase"] = "measuring_g1"
+        Job_settings.thk_cal = view
+        if getattr(self, "_thk_cal_win", None) is None or not self._thk_cal_win.winfo_exists():
+            self._build_thk_cal_window()
+        self._update_thk_cal_window()
+
     def _open_view_calibration(self):
         """Operator-triggered: read the last saved calibration from JSON, populate the
         shared view, and open the window. If a calibration sequence later starts on the
@@ -1729,6 +1864,13 @@ class EL_UI(tk.Tk):
 
             self._update_plc_indicator()
 
+            if hasattr(self, "hdr_cal_status"):
+                self.hdr_cal_status.config(
+                    text=CalGate.StatusText(),
+                    foreground=("#127a1f" if CalGate.WorkAllowed else "#b00000"),
+                )
+                self.hdr_last_cal.config(text=CalGate.LastCalText())
+
             # Snapshot each shared PIL once (the producing threads may swap it mid-refresh).
             pil1 = Job_settings.pil1
             if pil1 is not None and hasattr(self, "info_img_lbl"):
@@ -1776,11 +1918,13 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=T2, daemon=True)
     t3 = threading.Thread(target=T3_thickness, daemon=True)
     t4 = threading.Thread(target=T4_plc_flush, daemon=True)
+    t5 = threading.Thread(target=T5_startup_gate, daemon=True)
 
     t4.start()
     t1.start()
     t2.start()
     t3.start()
+    t5.start()
 
 
     app = EL_UI()

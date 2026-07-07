@@ -1,0 +1,9 @@
+{
+  "off_time_threshold_minutes": 2,
+  "warmup_minutes": 10,
+  "zeroing_after_first_minutes": 5,
+  "zeroing_after_second_minutes": 20,
+  "zeroing_interval_minutes": 60,
+  "heartbeat_interval_seconds": 60,
+  "zeroing_popup_seconds": 15
+}
