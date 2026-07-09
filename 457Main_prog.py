@@ -7,6 +7,7 @@ import json
 from collections import deque
 from PIL import Image, ImageTk
 import time
+import datetime
 import threading
 import os
 import pandas as pd
@@ -116,6 +117,255 @@ def log(msg, level="INFO"):
         print(line)
         with open("system_log.txt", "a") as f:
             f.write(line + "\n")
+
+
+# ----------------------------
+# Zeroing schedule + heartbeat
+# ----------------------------
+# Reference to the running Tk root; set in EL_UI.__init__ so background
+# threads can schedule the zeroing popup on the main thread (Tk is not
+# thread-safe). Stays None until the UI is up.
+APP_UI = None
+
+
+class ZeroingSchedule_:
+    """Power-on / restart zeroing schedule + last-working-time heartbeat.
+
+    On startup compares the off-time (now - last heartbeat) against a
+    threshold: short gaps resume immediately (single zeroing, no warmup);
+    long gaps run the full warmup -> 10 -> +5 -> +20 -> hourly schedule.
+    Intervals are read from config/config457_zeroing.json (editable).
+    """
+    ConfigPath = os.path.join("config", "config457_zeroing.json")
+    StatePath = os.path.join("config", "last_working_time.json")
+
+    Defaults = {
+        "off_time_threshold_minutes": 2,
+        "warmup_minutes": 10,
+        "zeroing_after_first_minutes": 5,
+        "zeroing_after_second_minutes": 20,
+        "zeroing_interval_minutes": 60,
+        "heartbeat_interval_seconds": 60,
+        "zeroing_popup_seconds": 15,
+    }
+
+    def __init__(self):
+        # Runtime flags (read by T2 gate and the UI status label)
+        self.WorkAllowed = False
+        self.ZeroingInProgress = False
+        self.SessionMode = None  # "resume" | "cold_start"
+
+        # Scheduler state (long path)
+        self.session_start = None
+        self.zeroings_done = 0
+        self.next_zeroing_due = None  # epoch seconds, None = nothing scheduled
+        self._last_heartbeat = 0.0
+
+        self._load_config()
+
+    # ---- config ----
+    def _load_config(self):
+        cfg = dict(self.Defaults)
+        try:
+            if os.path.isfile(self.ConfigPath):
+                with open(self.ConfigPath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for k in self.Defaults:
+                    if k in data:
+                        cfg[k] = data[k]
+        except Exception as e:
+            log(f"ZeroingSchedule: config load failed, using defaults: {e}", "WARN")
+        self.off_time_threshold_minutes = float(cfg["off_time_threshold_minutes"])
+        self.warmup_minutes = float(cfg["warmup_minutes"])
+        self.zeroing_after_first_minutes = float(cfg["zeroing_after_first_minutes"])
+        self.zeroing_after_second_minutes = float(cfg["zeroing_after_second_minutes"])
+        self.zeroing_interval_minutes = float(cfg["zeroing_interval_minutes"])
+        self.heartbeat_interval_seconds = float(cfg["heartbeat_interval_seconds"])
+        self.zeroing_popup_seconds = float(cfg["zeroing_popup_seconds"])
+
+    # ---- state file (last_working_time.json) ----
+    def _read_state(self):
+        try:
+            if os.path.isfile(self.StatePath):
+                with open(self.StatePath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            log(f"ZeroingSchedule: state read failed: {e}", "WARN")
+        return None
+
+    def _write_state(self, **updates):
+        data = self._read_state() or {}
+        data.update(updates)
+        try:
+            os.makedirs(os.path.dirname(self.StatePath), exist_ok=True)
+            with open(self.StatePath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            log(f"ZeroingSchedule: state write failed: {e}", "WARN")
+
+    def ComputeOffMinutes(self):
+        """Minutes since last heartbeat. None if file missing/invalid."""
+        st = self._read_state()
+        if not st or "last_working_time" not in st:
+            return None
+        try:
+            last = datetime.datetime.fromisoformat(st["last_working_time"])
+        except Exception:
+            return None
+        return (datetime.datetime.now() - last).total_seconds() / 60.0
+
+    def SaveHeartbeat(self):
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        self._write_state(last_working_time=now)
+        self._last_heartbeat = time.time()
+
+    # ---- session start / decision ----
+    def StartSession(self):
+        self.session_start = time.time()
+        off = self.ComputeOffMinutes()
+
+        if off is None:
+            self.SessionMode = "cold_start"
+            log("Session cold_start: last_working_time missing/invalid -> full schedule", "INFO")
+            self._begin_cold_start()
+        elif off < self.off_time_threshold_minutes:
+            self.SessionMode = "resume"
+            log(f"Session resume: off={off:.1f} min, skipping warmup", "INFO")
+            self.WorkAllowed = True
+            Zero_thickness_gauge()  # single zeroing, then work
+        else:
+            self.SessionMode = "cold_start"
+            log(f"Session cold_start: off={off:.1f} min > threshold "
+                f"{self.off_time_threshold_minutes} min", "INFO")
+            self._begin_cold_start()
+
+        # First heartbeat right away so a quick restart is detected correctly.
+        self.SaveHeartbeat()
+
+    def _begin_cold_start(self):
+        self.WorkAllowed = False
+        self.zeroings_done = 0
+        # Zero #1 is due at warmup_minutes from session start.
+        self.next_zeroing_due = self.session_start + self.warmup_minutes * 60.0
+
+    # ---- scheduler tick (called ~every second from T5) ----
+    def CheckSchedule(self):
+        if self.SessionMode != "cold_start" or self.next_zeroing_due is None:
+            return
+        if time.time() < self.next_zeroing_due:
+            return
+
+        self.zeroings_done += 1
+        n = self.zeroings_done
+        log(f"Zeroing milestone #{n} due, calling Zero_thickness_gauge", "INFO")
+
+        if n == 1:
+            self.WorkAllowed = True  # warmup over
+
+        Zero_thickness_gauge()
+
+        # Schedule the next milestone.
+        if n == 1:
+            delta_min = self.zeroing_after_first_minutes
+        elif n == 2:
+            delta_min = self.zeroing_after_second_minutes
+        else:
+            delta_min = self.zeroing_interval_minutes
+        self.next_zeroing_due = time.time() + delta_min * 60.0
+        try:
+            self._write_state(next_zeroing_due=datetime.datetime.fromtimestamp(
+                self.next_zeroing_due).isoformat(timespec="seconds"))
+        except Exception:
+            pass
+
+
+ZeroingSchedule = ZeroingSchedule_()
+
+
+def Zero_thickness_gauge():
+    """Trigger a zeroing of the thickness gauge.
+
+    v1 (temporary): show a modal-style popup with big text for operator
+    feedback, auto-closing after zeroing_popup_seconds. Real logic later:
+    PLC handshake (RegsToPlc[0] = 2 hold / 3 resume for gage calibration)
+    plus thickness-module calls; the popup can stay as feedback or be removed.
+
+    Safe to call from a background thread: the popup is scheduled on the Tk
+    main thread via APP_UI.after(0, ...).
+    """
+    if ZeroingSchedule.ZeroingInProgress:
+        log("Zero_thickness_gauge: zeroing already in progress, skipping duplicate", "INFO")
+        return
+
+    ZeroingSchedule.ZeroingInProgress = True
+
+    app = APP_UI
+    if app is None:
+        # No UI yet -> can't show popup; don't block production on the flag.
+        log("Zero_thickness_gauge: UI not ready, popup skipped", "WARN")
+        ZeroingSchedule.ZeroingInProgress = False
+        return
+
+    app.after(0, _show_zeroing_popup)
+
+
+def _show_zeroing_popup():
+    """Runs on the Tk main thread. Opens the zeroing popup + schedules close."""
+    app = APP_UI
+    if app is None:
+        ZeroingSchedule.ZeroingInProgress = False
+        return
+    try:
+        existing = getattr(app, "_zeroing_win", None)
+        if existing is not None and existing.winfo_exists():
+            log("Zero_thickness_gauge: popup already open", "INFO")
+            return
+
+        win = tk.Toplevel(app)
+        app._zeroing_win = win
+        win.title("Zeroing")
+        win.resizable(False, False)
+
+        tk.Label(win, text="I'm in zeroing process",
+                 font=("Arial", 32, "bold"), padx=60, pady=60).pack(expand=True, fill="both")
+
+        w, h = 700, 300
+        try:
+            app.update_idletasks()
+            x = app.winfo_rootx() + (app.winfo_width() - w) // 2
+            y = app.winfo_rooty() + (app.winfo_height() - h) // 2
+            win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
+
+        try:
+            win.grab_set()  # block other clicks while zeroing
+        except Exception:
+            pass
+
+        log("Zero_thickness_gauge: popup shown", "INFO")
+        ms = int(ZeroingSchedule.zeroing_popup_seconds * 1000)
+        win.after(ms, lambda: _close_zeroing_popup(win))
+    except Exception as e:
+        log(f"Zero_thickness_gauge: popup error {e}", "WARN")
+        ZeroingSchedule.ZeroingInProgress = False
+
+
+def _close_zeroing_popup(win):
+    """Runs on the Tk main thread. Closes the popup and clears the flag."""
+    try:
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+    except Exception:
+        pass
+    if APP_UI is not None:
+        APP_UI._zeroing_win = None
+    ZeroingSchedule.ZeroingInProgress = False
+    log("Zero_thickness_gauge: popup closed", "INFO")
+
 
 class Job_settings_():
     # Keys persisted only in Job_settings.json (not from CSV/XLSX)
@@ -260,6 +510,10 @@ def T2():
 
 
     while not Job_settings.stop_event.is_set():
+        # Block inspection during warmup and while a zeroing is in progress.
+        if (not ZeroingSchedule.WorkAllowed) or ZeroingSchedule.ZeroingInProgress:
+            time.sleep(0.05)
+            continue
         mv.img.refresh()
         if time.time()-t1>0.3 and state !=3:
             im2 = to_pil(mv.img.last_img)
@@ -336,6 +590,32 @@ def T3_thickness():
         time.sleep(0.2)
 
     ThckModule.stop()
+
+
+def T5_zeroing_schedule():
+    """Zeroing-schedule + heartbeat daemon.
+
+    Waits for the Tk UI, starts the session (short resume vs full cold-start
+    schedule), then every ~1 s checks for a due zeroing milestone and writes
+    the last_working_time heartbeat every heartbeat_interval_seconds.
+    """
+    # Wait (up to ~10 s) for the UI so resume-path / milestone popups can render.
+    for _ in range(100):
+        if APP_UI is not None or Job_settings.stop_event.is_set():
+            break
+        time.sleep(0.1)
+
+    ZeroingSchedule.StartSession()
+
+    while not Job_settings.stop_event.is_set():
+        try:
+            ZeroingSchedule.CheckSchedule()
+            if time.time() - ZeroingSchedule._last_heartbeat >= ZeroingSchedule.heartbeat_interval_seconds:
+                ZeroingSchedule.SaveHeartbeat()
+                log(f"Heartbeat saved last_working_time (mode={ZeroingSchedule.SessionMode})", "INFO")
+        except Exception as e:
+            log(f"T5_zeroing_schedule error: {e}", "WARN")
+        time.sleep(1.0)
 
 
 def T4_plc_flush():
@@ -665,6 +945,9 @@ def GetNewJob(value):
 class EL_UI(tk.Tk):
     def __init__(self):
         super().__init__()
+        global APP_UI
+        APP_UI = self  # let background threads schedule the zeroing popup here
+        self._zeroing_win = None
         self.title("King Engine Bearings End Line Machine 457")
         self.geometry("1650x850")
         self.resizable(False, False)
@@ -1111,6 +1394,10 @@ class EL_UI(tk.Tk):
         self.plc_text_lbl = ttk.Label(plc_frame, text="")
         self.plc_text_lbl.pack(side="left", padx=(6, 0))
 
+        # Read-only zeroing / work-allowed status
+        self.zeroing_status_lbl = ttk.Label(right_bar, text="Work: --")
+        self.zeroing_status_lbl.pack(side="left", padx=(0, 12))
+
         ttk.Button(right_bar, text="Refresh", command=self._on_refresh).pack(side="left", padx=(0, 6))
         ttk.Button(right_bar, text="Close", command=self._on_close).pack(side="left")
 
@@ -1464,6 +1751,12 @@ class EL_UI(tk.Tk):
         RegsToPlc[1] = 3  # stop conveyor
         RegsToPlc[2] = 1  ##turn green light off
         RegsToPlc[3] = 1  ##turn white light off
+        try:
+            now = datetime.datetime.now().isoformat(timespec="seconds")
+            ZeroingSchedule._write_state(last_working_time=now, last_shutdown_time=now)
+            log("Shutdown: wrote last_working_time and last_shutdown_time", "INFO")
+        except Exception as e:
+            log(f"Shutdown state write failed: {e}", "WARN")
         time.sleep(0.2)
         Job_settings.stop_event.set()
         self.destroy()
@@ -1484,6 +1777,22 @@ class EL_UI(tk.Tk):
             self.plc_icon_lbl.image = tk_img  # keep reference!
             self._plc_last_state = connected
 
+    def _update_zeroing_status(self):
+        if not hasattr(self, "zeroing_status_lbl"):
+            return
+        zs = ZeroingSchedule
+        if zs.ZeroingInProgress:
+            txt = "Zeroing..."
+        elif not zs.WorkAllowed:
+            txt = "Work: Blocked (warmup)"
+        else:
+            txt = "Work: Allowed"
+        # Minutes until next zeroing (long-path / cold-start sessions only)
+        if zs.SessionMode == "cold_start" and zs.next_zeroing_due is not None:
+            mins = max(0.0, (zs.next_zeroing_due - time.time()) / 60.0)
+            txt += f" | next zero: {mins:.1f}m"
+        self.zeroing_status_lbl.config(text=txt)
+
     def _refresh_from_Job_settings(self):
 
 
@@ -1494,6 +1803,7 @@ class EL_UI(tk.Tk):
         self.hdr_wo_obj_counter.config(text=str(getattr(Job_settings, 'wo_object_counter', '')))
 
         self._update_plc_indicator()
+        self._update_zeroing_status()
 
         if Job_settings.pil1 is not None and hasattr(self, "info_img_lbl"):
             Job_settings.img1 = ImageTk.PhotoImage(Job_settings.pil1)
@@ -1533,11 +1843,13 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=T2, daemon=True)
     t3 = threading.Thread(target=T3_thickness, daemon=True)
     t4 = threading.Thread(target=T4_plc_flush, daemon=True)
+    t5 = threading.Thread(target=T5_zeroing_schedule, daemon=True)
 
     t4.start()
     t1.start()
     t2.start()
     t3.start()
+    t5.start()
 
 
     app = EL_UI()

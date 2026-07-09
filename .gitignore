@@ -12,3 +12,7 @@ capture/
 .idea/
 *.swp
 .DS_Store
+
+# Runtime heartbeat / zeroing state (auto-written)
+config/last_working_time.json
+system_log.txt
