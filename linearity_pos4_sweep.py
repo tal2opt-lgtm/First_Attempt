@@ -51,13 +51,10 @@ REG_LIVESIGN    = 0     # PC -> PLC : 1 = alive
 REG_HORIZ_CMD   = 6     # PC -> PLC : M6 command (left idle here)
 REG_VERT_CMD    = 10    # PC -> PLC : M7 command
 REG_VERT_STATUS = 26    # PLC -> PC : M7 status
-# M7 actual position: a single 16-bit register in microns. The axis coordinate
-# is referenced to a homing sensor and runs NEGATIVE -> 0 -> POSITIVE, so it is
-# read as a SIGNED 16-bit value (two's complement). Confirmed by a diagnostic
-# run: reg28 is a different quantity (bearing width ~205), NOT a high word, so
-# the position is reg27 alone. NOTE: the readback is only valid once the axis
-# has crossed the homing reference - home the axis before running.
-REG_VERT_POS = 27       # PLC -> PC : M7 actual position (signed 16-bit, microns)
+# M7 actual position: a single register in microns. Homing is handled in
+# hardware, so after homing the value starts at 0 and only increases (no
+# negative side), and is read directly as-is.
+REG_VERT_POS = 27       # PLC -> PC : M7 actual position ("position" column)
 
 VCMD_IDLE   = 0         # M7: no command
 VCMD_POS4   = 4         # M7: Go position 4  (the relative "POS4" move)
@@ -83,14 +80,7 @@ SAMPLE_N       = 40     # median over the newest N fresh samples per sensor
 FRESH_MIN      = 8      # min fresh samples needed before we trust a read
 FRESH_WAIT_SEC = 2.0    # max wait for fresh samples after a flush
 
-EXCEL_COLUMNS = ["step", "top_mm", "bottom_mm", "position", "thickness_mm",
-                 "pos_raw"]
-
-
-def _s16(v):
-    """Interpret a 16-bit register as a signed value (two's complement)."""
-    v = int(v) & 0xFFFF
-    return v - (1 << 16) if v >= (1 << 15) else v
+EXCEL_COLUMNS = ["step", "top_mm", "bottom_mm", "position", "thickness_mm"]
 
 
 # =============================================================================
@@ -134,22 +124,17 @@ class Plc:
         self._write()
 
     def read_vert_pos(self):
-        """Return (position_um_signed, raw_reg27). Position is signed so the
-        negative -> 0 -> positive homing coordinate reads correctly."""
         regs = self.read()
-        if regs is None:
-            return None, None
-        raw = regs[REG_VERT_POS]
-        return _s16(raw), raw
+        return None if regs is None else regs[REG_VERT_POS]
 
     def pos4_step(self):
         """Press POS4 once: command reg10=4, wait until the axis has moved and
-        settled, then idle. Returns (final_position_um_signed, ok). ok=False
-        means the move did not clearly complete within POS4_TIMEOUT_SEC."""
+        settled, then idle. Returns (final_reg27, ok). ok=False means the move
+        did not clearly complete within POS4_TIMEOUT_SEC."""
         regs = self.read()
         if regs is None:
             return None, False
-        init_pos = _s16(regs[REG_VERT_POS])
+        init_pos = regs[REG_VERT_POS]
 
         # Clean rising edge, then command the relative move.
         self.idle()
@@ -165,7 +150,7 @@ class Plc:
         while time.time() - t0 < POS4_TIMEOUT_SEC:
             regs = self.read()
             if regs is not None:
-                last_pos  = _s16(regs[REG_VERT_POS])
+                last_pos  = regs[REG_VERT_POS]
                 last_stat = regs[REG_VERT_STATUS]
                 if abs(last_pos - init_pos) >= POS4_MOTION_MIN or last_stat in VST_MOVING:
                     motion_seen = True
@@ -308,13 +293,12 @@ def main():
         print(f"[init] sensors streaming (TOP={nt}, BOTTOM={nb})")
 
         # --- Baseline row at the current position, before any move ---
-        pos0, raw0 = plc.read_vert_pos()
+        pos0 = plc.read_vert_pos()
         r0 = read_sensors(state)
         rows.append({"step": 0, "top_mm": r0["top_mm"], "bottom_mm": r0["bottom_mm"],
-                     "position": pos0, "thickness_mm": r0["thickness_mm"],
-                     "pos_raw": raw0})
-        print(f"[step 0] pos={pos0} um (raw={raw0})  top={r0['top_mm']}  "
-              f"bot={r0['bottom_mm']}  thk={r0['thickness_mm']}")
+                     "position": pos0, "thickness_mm": r0["thickness_mm"]})
+        print(f"[step 0] pos={pos0}  top={r0['top_mm']}  bot={r0['bottom_mm']}  "
+              f"thk={r0['thickness_mm']}")
 
         # --- POS4 sweep: press POS4 `steps` times, sampling after each ---
         for s in range(1, args.steps + 1):
@@ -323,13 +307,12 @@ def main():
                 print(f"[step {s}] WARNING: POS4 move did not clearly complete "
                       f"(pos={pos}) - recording anyway")
             r = read_sensors(state)
-            pos_read, raw = plc.read_vert_pos()  # position at the moment we sample
+            pos_read = plc.read_vert_pos()  # position at the moment we sample
             if pos_read is not None:
                 pos = pos_read
             rows.append({"step": s, "top_mm": r["top_mm"], "bottom_mm": r["bottom_mm"],
-                         "position": pos, "thickness_mm": r["thickness_mm"],
-                         "pos_raw": raw})
-            print(f"[step {s}/{args.steps}] pos={pos} um (raw={raw})  top={r['top_mm']}  "
+                         "position": pos, "thickness_mm": r["thickness_mm"]})
+            print(f"[step {s}/{args.steps}] pos={pos}  top={r['top_mm']}  "
                   f"bot={r['bottom_mm']}  thk={r['thickness_mm']}")
 
         export_excel(rows, out_path)
