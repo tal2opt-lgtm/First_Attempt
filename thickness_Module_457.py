@@ -182,22 +182,35 @@ class ThicknessConfig(object):
 
         # --- Continuous-run (sweep) calibration ---
         # The gauges are measured by a single continuous M6 move over BOTH of them
-        # (Pos2 -> Pos3). Each gauge shows up as a "plateau" of in-range samples; the
-        # air gap between them (and the leading/trailing air) shows up as runs of
-        # out-of-range samples. Segmentation splits the captured stream into plateaus:
-        #   - sweep_min_air_run:        min consecutive air samples to count as a real
-        #                               gap (shorter air blips inside a plateau are bridged).
-        #   - sweep_min_plateau_samples: min in-range samples for a run to count as a gauge
-        #                               (drops tiny artifacts); after filtering we require
-        #                               EXACTLY two plateaus or the run is rejected.
-        #   - sweep_edge_trim_frac:     fraction trimmed from EACH end of every plateau
-        #                               before averaging (ramp as the sensor climbs on/off
-        #                               the gauge). 0.25 => average the middle 50%.
-        # No std/stability gate: on a precise gauge measured in motion the ripple is
-        # symmetric and cancels in the mean, so the mean alone is the acceptance value.
-        self.CAL_SWEEP_MIN_AIR_RUN = int(cal.get("sweep_min_air_run", 3))
-        self.CAL_SWEEP_MIN_PLATEAU_SAMPLES = int(cal.get("sweep_min_plateau_samples", 30))
+        # (Pos2 -> Pos3). Each gauge is a region of in-range samples; the two gauges
+        # are separated by ONE dominant air gap (1-3 mm of pure air = a long run of
+        # out-of-range samples). A precise gauge measured in motion produces momentary
+        # dropouts that fragment it into several in-range runs, so we do NOT rely on
+        # fixed sample-count thresholds. Instead the segmenter finds the single LARGEST
+        # air gap and splits there (gauge 1 = everything before it, gauge 2 = after),
+        # bridging every shorter internal dropout. This is immune to sweep speed and to
+        # the number of dropouts.
+        #   - sweep_gap_dominance:       the inter-gauge gap must be at least this many
+        #                                times larger than the next-largest air gap,
+        #                                otherwise the structure is ambiguous and the
+        #                                run is rejected (replaces the old "exactly two
+        #                                plateaus" check).
+        #   - sweep_min_plateau_samples: min in-range samples on EACH side; guards
+        #                                against a degenerate tiny span.
+        #   - sweep_edge_trim_frac:      fraction trimmed from EACH end of each gauge
+        #                                region before averaging (ramp as the sensor
+        #                                climbs on/off the gauge). 0.25 => middle 50%.
+        # No std/stability gate: the ripple is symmetric and cancels in the mean, so the
+        # mean alone is the acceptance value.
+        self.CAL_SWEEP_GAP_DOMINANCE = float(cal.get("sweep_gap_dominance", 3.0))
+        self.CAL_SWEEP_MIN_PLATEAU_SAMPLES = int(cal.get("sweep_min_plateau_samples", 300))
         self.CAL_SWEEP_EDGE_TRIM_FRAC = float(cal.get("sweep_edge_trim_frac", 0.25))
+        #   - sweep_min_gauge_separation_mm: the two gauges have DIFFERENT thicknesses,
+        #     so their raw sensor sums must differ by at least this much. If the two
+        #     segmented regions read nearly the same, the "gap" was a dropout inside a
+        #     single gauge (not the inter-gauge gap) -> reject. Guards the case where
+        #     only one air gap exists so the dominance test cannot fire.
+        self.CAL_SWEEP_MIN_GAUGE_SEPARATION_MM = float(cal.get("sweep_min_gauge_separation_mm", 0.1))
 
 class ThicknessRuntimeState(object):
     def __init__(self, cfg: ThicknessConfig):
@@ -594,49 +607,63 @@ class ThicknessProcessor(object):
 # =========================
 # Continuous-run (sweep) calibration: plateau segmentation
 # =========================
-def _segment_calibration_plateaus(mask, min_air_run, min_plateau):
-    """Split a boolean in-range mask into gauge 'plateaus'.
+def _segment_calibration_plateaus(mask, min_plateau, gap_dominance):
+    """Split a boolean in-range mask into the two gauge regions.
 
-    A plateau is a contiguous run of in-range (solid) samples. Air (out-of-range)
-    runs SHORTER than min_air_run that sit *inside* a plateau are bridged (treated as
-    solid), so a momentary sensor dropout on a gauge does not split it. Leading and
-    trailing air (at the very start/end of the capture) is never bridged. Runs shorter
-    than min_plateau samples are discarded as artifacts.
+    Physical model: exactly two gauges separated by ONE dominant air gap. A precise
+    gauge measured in motion produces momentary dropouts, so a single gauge may appear
+    as several in-range runs. Rather than thresholding run/gap lengths (speed
+    dependent), we locate the single LARGEST air gap between in-range runs and split
+    there: gauge 1 = span from the first in-range run up to that gap, gauge 2 = span
+    from just after the gap to the last in-range run. Every shorter internal dropout is
+    thereby bridged.
 
-    Returns a list of half-open (start, end) index ranges, in travel order.
+    Guards:
+      - need at least two in-range runs (else no gap to split on);
+      - the largest gap must be >= gap_dominance x the next-largest gap (a clear single
+        separator), else the structure is ambiguous;
+      - each resulting span must hold >= min_plateau in-range samples.
+
+    Returns (spans, reason): spans is [(s0,e0),(s1,e1)] in travel order on success, or
+    [] on failure with a human-readable reason.
     """
     n = len(mask)
-    solid = list(mask)
 
-    # Bridge short *internal* air runs.
-    i = 0
-    while i < n:
-        if not solid[i]:
-            j = i
-            while j < n and not solid[j]:
-                j += 1
-            air_len = j - i
-            if air_len < min_air_run and i > 0 and j < n:
-                for k in range(i, j):
-                    solid[k] = True
-            i = j
-        else:
-            i += 1
-
-    # Collect contiguous solid runs above the minimum length.
+    # Maximal in-range runs.
     runs = []
     i = 0
     while i < n:
-        if solid[i]:
+        if mask[i]:
             j = i
-            while j < n and solid[j]:
+            while j < n and mask[j]:
                 j += 1
-            if (j - i) >= min_plateau:
-                runs.append((i, j))
+            runs.append((i, j))
             i = j
         else:
             i += 1
-    return runs
+
+    if len(runs) < 2:
+        return [], f"need >=2 in-range regions, found {len(runs)}"
+
+    # Air gaps between consecutive in-range runs.
+    gaps = [runs[k + 1][0] - runs[k][1] for k in range(len(runs) - 1)]
+    split = max(range(len(gaps)), key=lambda k: gaps[k])
+    biggest = gaps[split]
+    others = [g for k, g in enumerate(gaps) if k != split]
+    second = max(others) if others else 0
+    if second > 0 and biggest < gap_dominance * second:
+        return [], (f"no dominant air gap (largest={biggest}, next={second}, "
+                    f"need >={gap_dominance:g}x) — ambiguous plateau structure")
+
+    span1 = (runs[0][0], runs[split][1])
+    span2 = (runs[split + 1][0], runs[-1][1])
+
+    c1 = sum(1 for k in range(span1[0], span1[1]) if mask[k])
+    c2 = sum(1 for k in range(span2[0], span2[1]) if mask[k])
+    if c1 < min_plateau or c2 < min_plateau:
+        return [], f"gauge region too small (g1={c1}, g2={c2}, min={min_plateau})"
+
+    return [span1, span2], "ok"
 
 
 # =========================
@@ -756,15 +783,15 @@ class ThicknessModule(object):
         plateau is edge-trimmed (CAL_SWEEP_EDGE_TRIM_FRAC per end) and averaged — no
         std/stability gate, the mean is the value (ripple cancels in the mean).
         """
-        min_air = int(self.cfg.CAL_SWEEP_MIN_AIR_RUN)
         min_plat = int(self.cfg.CAL_SWEEP_MIN_PLATEAU_SAMPLES)
+        dominance = float(self.cfg.CAL_SWEEP_GAP_DOMINANCE)
         trim = float(self.cfg.CAL_SWEEP_EDGE_TRIM_FRAC)
 
         buffer = list(buffer or [])
         mask = [bool(ir and (s is not None)) for (ir, s) in buffer]
         sums = [s for (ir, s) in buffer]
 
-        runs = _segment_calibration_plateaus(mask, min_air, min_plat)
+        runs, reason = _segment_calibration_plateaus(mask, min_plat, dominance)
 
         result = {"ok": False, "reason": "", "n": len(buffer), "plateaus": [],
                   "raw_g1_mm": None, "g1_std_um": None,
@@ -786,17 +813,22 @@ class ThicknessModule(object):
                     "std_um": float(np.std(arr) * 1000.0)}
 
         if len(runs) != 2:
-            # Surface what we found (untrimmed) for diagnostics, then fail.
-            for (s0, s1) in runs:
-                st = _plateau_stats(s0, s1, do_trim=False)
-                if st is not None:
-                    result["plateaus"].append(st)
-            result["reason"] = f"expected 2 gauge plateaus, found {len(runs)}"
+            result["reason"] = reason
             return result
 
         stats = [_plateau_stats(s0, s1, do_trim=True) for (s0, s1) in runs]
         if any(st is None for st in stats):
-            result["reason"] = "empty plateau after trimming"
+            result["reason"] = "empty gauge region after trimming"
+            return result
+
+        # Two DIFFERENT gauges must read differently; if the two regions are nearly
+        # identical the split fell on a dropout inside a single gauge, not the real gap.
+        min_sep = float(self.cfg.CAL_SWEEP_MIN_GAUGE_SEPARATION_MM)
+        sep = abs(stats[0]["raw_mean_mm"] - stats[1]["raw_mean_mm"])
+        if sep < min_sep:
+            result["plateaus"] = stats
+            result["reason"] = (f"gauge regions too similar (|Δ|={sep*1000.0:.1f}um < "
+                                f"{min_sep*1000.0:.0f}um) — likely one gauge split by a dropout")
             return result
 
         result["plateaus"] = stats
