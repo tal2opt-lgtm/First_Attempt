@@ -180,6 +180,25 @@ class ThicknessConfig(object):
         self.CAL_DRIFT_WARN_MM = float(cal.get("drift_warn_mm", 0.5))
         self.CAL_HISTORY_MAX = int(cal.get("history_max", 20))
 
+        # --- Continuous-run (sweep) calibration ---
+        # The gauges are measured by a single continuous M6 move over BOTH of them
+        # (Pos2 -> Pos3). Each gauge shows up as a "plateau" of in-range samples; the
+        # air gap between them (and the leading/trailing air) shows up as runs of
+        # out-of-range samples. Segmentation splits the captured stream into plateaus:
+        #   - sweep_min_air_run:        min consecutive air samples to count as a real
+        #                               gap (shorter air blips inside a plateau are bridged).
+        #   - sweep_min_plateau_samples: min in-range samples for a run to count as a gauge
+        #                               (drops tiny artifacts); after filtering we require
+        #                               EXACTLY two plateaus or the run is rejected.
+        #   - sweep_edge_trim_frac:     fraction trimmed from EACH end of every plateau
+        #                               before averaging (ramp as the sensor climbs on/off
+        #                               the gauge). 0.25 => average the middle 50%.
+        # No std/stability gate: on a precise gauge measured in motion the ripple is
+        # symmetric and cancels in the mean, so the mean alone is the acceptance value.
+        self.CAL_SWEEP_MIN_AIR_RUN = int(cal.get("sweep_min_air_run", 3))
+        self.CAL_SWEEP_MIN_PLATEAU_SAMPLES = int(cal.get("sweep_min_plateau_samples", 30))
+        self.CAL_SWEEP_EDGE_TRIM_FRAC = float(cal.get("sweep_edge_trim_frac", 0.25))
+
 class ThicknessRuntimeState(object):
     def __init__(self, cfg: ThicknessConfig):
         self.cfg = cfg
@@ -259,8 +278,12 @@ class ThicknessRuntimeState(object):
             self.cal_buffer = []
             self.cal_collecting = True
 
-    def cal_add_sample(self, v_mm):
-        self.cal_buffer.append(float(v_mm))
+    def cal_add_sample(self, v_mm, in_range=True):
+        # Store (in_range, sensor_sum_mm). Air/out-of-range samples are stored with
+        # in_range=False and v_mm=None, so the sweep segmenter can see where the gap
+        # (and leading/trailing air) is. The legacy static measure_gauge simply keeps
+        # the in-range sums.
+        self.cal_buffer.append((bool(in_range), (float(v_mm) if v_mm is not None else None)))
 
     def cal_end_collect(self):
         with self.lock:
@@ -366,6 +389,21 @@ class ThicknessProcessor(object):
             t_time, top_abs_mm = t_samp
             b_time, bot_abs_mm = b_samp
 
+            both_in_range = (top_abs_mm < self.cfg.ERROR_THRESHOLD_MM) and (bot_abs_mm < self.cfg.ERROR_THRESHOLD_MM)
+
+            # Calibration capture mode: gather the FULL synced stream, INCLUDING air
+            # (out-of-range) samples, so the sweep segmenter can see plateau/gap
+            # structure (each gauge = a plateau of in-range samples; the gap between
+            # them and the leading/trailing travel = runs of air). This must run BEFORE
+            # the error-threshold handling below, which otherwise drops air samples.
+            # No part/pass logic and no PLC verdict while capturing.
+            if self.state.cal_collecting:
+                if both_in_range:
+                    self.state.cal_add_sample(top_abs_mm + bot_abs_mm, in_range=True)
+                else:
+                    self.state.cal_add_sample(None, in_range=False)
+                continue
+
             if top_abs_mm >= self.cfg.ERROR_THRESHOLD_MM and bot_abs_mm >= self.cfg.ERROR_THRESHOLD_MM:
                 self.state.error_count += 1
                 if self.state.object_in_measurement and self.state.error_count >= self.cfg.MAX_ERROR_COUNT:
@@ -375,12 +413,6 @@ class ThicknessProcessor(object):
                 self.state.error_count = 0
 
             sensors_sum_mm = top_abs_mm + bot_abs_mm
-
-            # Calibration capture mode: gather raw sensor-sum, skip all part/pass logic
-            # (so no verdict is produced to the PLC while a gauge is being measured).
-            if self.state.cal_collecting:
-                self.state.cal_add_sample(sensors_sum_mm)
-                continue
 
             # Normal path requires a valid two-point linearization.
             # Until the operator runs the calibration sequence, samples are discarded
@@ -560,6 +592,54 @@ class ThicknessProcessor(object):
         self.state.reset_pass()
 
 # =========================
+# Continuous-run (sweep) calibration: plateau segmentation
+# =========================
+def _segment_calibration_plateaus(mask, min_air_run, min_plateau):
+    """Split a boolean in-range mask into gauge 'plateaus'.
+
+    A plateau is a contiguous run of in-range (solid) samples. Air (out-of-range)
+    runs SHORTER than min_air_run that sit *inside* a plateau are bridged (treated as
+    solid), so a momentary sensor dropout on a gauge does not split it. Leading and
+    trailing air (at the very start/end of the capture) is never bridged. Runs shorter
+    than min_plateau samples are discarded as artifacts.
+
+    Returns a list of half-open (start, end) index ranges, in travel order.
+    """
+    n = len(mask)
+    solid = list(mask)
+
+    # Bridge short *internal* air runs.
+    i = 0
+    while i < n:
+        if not solid[i]:
+            j = i
+            while j < n and not solid[j]:
+                j += 1
+            air_len = j - i
+            if air_len < min_air_run and i > 0 and j < n:
+                for k in range(i, j):
+                    solid[k] = True
+            i = j
+        else:
+            i += 1
+
+    # Collect contiguous solid runs above the minimum length.
+    runs = []
+    i = 0
+    while i < n:
+        if solid[i]:
+            j = i
+            while j < n and solid[j]:
+                j += 1
+            if (j - i) >= min_plateau:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+# =========================
 # Headless public API
 # =========================
 class ThicknessModule(object):
@@ -624,16 +704,107 @@ class ThicknessModule(object):
         time.sleep(max(0.5, win))
         data = self.state.cal_end_collect()
 
-        if len(data) < 5:
-            return {"ok": False, "reason": "too few samples", "n": len(data),
+        # cal_end_collect returns (in_range, sum_mm) tuples; keep only in-range sums.
+        solid = [s for (ir, s) in data if ir and s is not None]
+        if len(solid) < 5:
+            return {"ok": False, "reason": "too few samples", "n": len(solid),
                     "raw_median_mm": None, "std_um": None}
 
-        arr = np.array(data, dtype=float)
+        arr = np.array(solid, dtype=float)
         med = float(np.median(arr))
         std_um = float(np.std(arr) * 1000.0)
         ok = std_um <= float(self.cfg.CAL_STABILITY_MAX_STD_UM)
         return {"ok": ok, "reason": ("" if ok else "unstable (std too high)"),
-                "n": len(data), "raw_median_mm": med, "std_um": std_um}
+                "n": len(solid), "raw_median_mm": med, "std_um": std_um}
+
+    # =====================================================================
+    # Continuous-run (sweep) calibration.
+    # A single M6 move (Pos2 -> Pos3) carries the sensors over BOTH gauges in
+    # one pass. begin_calibration_sweep() starts capturing; the motion driver
+    # then commands the move and, on arrival at Pos3, calls
+    # finish_calibration_sweep() to segment the captured stream into the two
+    # gauge plateaus and return their trimmed-mean sensor sums.
+    # =====================================================================
+    def begin_calibration_sweep(self):
+        """Start capturing a continuous Pos2->Pos3 calibration sweep.
+
+        The caller must have the sensors at the Pos2 start point, call this, THEN
+        command the continuous move to Pos3, and call finish_calibration_sweep() once
+        arrival at Pos3 is confirmed. Everything the readers deliver in between (air +
+        both gauges) is captured.
+        """
+        self.state.reset_pass()            # make sure we are not mid-part
+        self.state.cal_begin_collect()
+
+    def finish_calibration_sweep(self):
+        """Stop capturing and segment the sweep into the two gauge plateaus.
+
+        Returns dict: {ok, reason, n, plateaus:[{n, raw_mean_mm, std_um}, ...],
+        raw_g1_mm, g1_std_um, raw_g2_mm, g2_std_um}. Plateau order is travel order:
+        the first plateau -> gauge 1 (gauge_1_known_mm), the second -> gauge 2.
+        """
+        buffer = self.state.cal_end_collect()
+        return self.analyze_calibration_sweep(buffer)
+
+    def analyze_calibration_sweep(self, buffer):
+        """Segment a captured sweep buffer into exactly two gauge plateaus.
+
+        buffer: list of (in_range: bool, sensor_sum_mm or None) as produced during
+        cal_collecting. Each gauge is a plateau of in-range samples; the air gap and
+        the leading/trailing travel are out-of-range runs. Segmentation bridges tiny
+        internal dropouts, drops artifacts, then requires EXACTLY two plateaus. Each
+        plateau is edge-trimmed (CAL_SWEEP_EDGE_TRIM_FRAC per end) and averaged — no
+        std/stability gate, the mean is the value (ripple cancels in the mean).
+        """
+        min_air = int(self.cfg.CAL_SWEEP_MIN_AIR_RUN)
+        min_plat = int(self.cfg.CAL_SWEEP_MIN_PLATEAU_SAMPLES)
+        trim = float(self.cfg.CAL_SWEEP_EDGE_TRIM_FRAC)
+
+        buffer = list(buffer or [])
+        mask = [bool(ir and (s is not None)) for (ir, s) in buffer]
+        sums = [s for (ir, s) in buffer]
+
+        runs = _segment_calibration_plateaus(mask, min_air, min_plat)
+
+        result = {"ok": False, "reason": "", "n": len(buffer), "plateaus": [],
+                  "raw_g1_mm": None, "g1_std_um": None,
+                  "raw_g2_mm": None, "g2_std_um": None}
+
+        def _plateau_stats(s0, s1, do_trim):
+            seg = [sums[k] for k in range(s0, s1) if sums[k] is not None]
+            if not seg:
+                return None
+            if do_trim:
+                m = len(seg)
+                lo = int(m * trim)
+                hi = m - int(m * trim)
+                core = seg[lo:hi] if (hi - lo) >= 1 else seg
+            else:
+                core = seg
+            arr = np.array(core, dtype=float)
+            return {"n": len(core), "raw_mean_mm": float(np.mean(arr)),
+                    "std_um": float(np.std(arr) * 1000.0)}
+
+        if len(runs) != 2:
+            # Surface what we found (untrimmed) for diagnostics, then fail.
+            for (s0, s1) in runs:
+                st = _plateau_stats(s0, s1, do_trim=False)
+                if st is not None:
+                    result["plateaus"].append(st)
+            result["reason"] = f"expected 2 gauge plateaus, found {len(runs)}"
+            return result
+
+        stats = [_plateau_stats(s0, s1, do_trim=True) for (s0, s1) in runs]
+        if any(st is None for st in stats):
+            result["reason"] = "empty plateau after trimming"
+            return result
+
+        result["plateaus"] = stats
+        result["raw_g1_mm"], result["g1_std_um"] = stats[0]["raw_mean_mm"], stats[0]["std_um"]
+        result["raw_g2_mm"], result["g2_std_um"] = stats[1]["raw_mean_mm"], stats[1]["std_um"]
+        result["ok"] = True
+        result["reason"] = "ok"
+        return result
 
     def compute_and_apply_calibration(self, raw_g1_mm, raw_g2_mm):
         """Two-point linear fit from the two gauge sensor-sum readings.

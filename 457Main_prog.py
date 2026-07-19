@@ -95,8 +95,12 @@ M6_STATUS_MOVING = (7, 8)  # going forward / backward
 M6_CMD_STOP = 7          # R6 Stop
 M6_CMD_JOG_FWD = 9       # R6 JOG forward
 M6_CMD_JOG_BACK = 10     # R6 JOG backward
-POS_GAUGE_1 = 5          # Johnson gauge 1
-POS_GAUGE_2 = 6          # Johnson gauge 2
+# Continuous-run calibration positions. The sensors are driven to the Pos2 start
+# point, then a single continuous move to the Pos3 end point carries them over BOTH
+# gauges in one pass (each gauge = a plateau; the air gap between them separates the
+# two). Speed/motion profile for these targets is defined on the HMI, not here.
+POS_STAGE = 2            # sweep start point (staging; capture begins on arrival here)
+POS_END = 3              # sweep end point (capture ends on arrival here)
 POS_MEASURE = 1          # measurement (work) position
 M6_MOVE_TIMEOUT_SEC = 60.0  # per Zero_thickness_gauge procedure (step 5): wait up to 60 s for arrival
 # T6 horizontal-centering sweep parameters. Motion uses a preset ABSOLUTE start
@@ -782,11 +786,6 @@ def run_calibration_sequence():
             f"last status={RegsFromPlc[M6_STATUS_REG]} actpos={RegsFromPlc[M6_ACTPOS_REG]}", "WARN")
         return False
 
-    def _measure(label):
-        res = tm.measure_gauge()
-        log(f"calibration: {label} measure result = {res}", "INFO")
-        return res
-
     # --- nested helper: set the procedure "step line" on the calibration window ---
     def _step(text):
         _publish(step_text=text)
@@ -799,13 +798,14 @@ def run_calibration_sequence():
         log(f"calibration: R0={value} ({label})", "STATUS")
 
     # ===================================================================
-    # ONE sequence: the button-triggered two-gauge calibration (core, from
-    # the original code — motion to each Johnson gauge + sampling + fit) is
-    # wrapped by the Zero_thickness_gauge procedure envelope
-    # (MD Docs/Zero_thickness_gauge_Procedure.md): pause machine -> settle
-    # -> [Pos5 damp+sample, Pos6 damp+sample, fit] -> debug hold -> return
-    # Pos1 -> resume. Vision (T2) is paused ONLY from after the 4 s settle until the
-    # sequence ends; M6 visits each position exactly once (no duplicated motion).
+    # ONE sequence: the button-triggered two-gauge calibration, now measured
+    # as a single CONTINUOUS sweep (M6: Pos2 start -> Pos3 end, over both
+    # gauges in one pass), wrapped by the Zero_thickness_gauge procedure
+    # envelope (MD Docs/Zero_thickness_gauge_Procedure.md): pause machine ->
+    # settle -> [Pos2, sweep to Pos3, segment+trim+average both plateaus, fit]
+    # -> debug hold -> return Pos1 -> resume. Vision (T2) is paused ONLY from
+    # after the 4 s settle until the sequence ends. The gauges are separated by
+    # the air gap between them; no per-gauge static stop and no std gate.
     # ===================================================================
     paused = False
     try:
@@ -829,34 +829,39 @@ def run_calibration_sequence():
         # resumes when this sequence ends (flag cleared in the finally block).
         Job_settings.zeroing_in_progress = True
 
-        # The sequence ALWAYS visits both gauges at both positions and samples each;
-        # success/failure is decided only after both measurements, at the fit step.
+        # The sequence runs ONE continuous sweep over both gauges; success/failure is
+        # decided after segmentation + fit. Plateau order is travel order: the first
+        # plateau -> gauge 1 (gauge_1_known_mm), the second -> gauge 2.
 
-        # --- Gauge 1 @ POS 5: move, vibration-damp, sample (procedure steps 4-7) ---
+        # --- Move to the Pos2 start point (no capture yet) ---
         _publish(phase="measuring_g1")
-        _step("M6 -> Pos5 (Johnson 1)")
-        if not _go_and_wait(POS_GAUGE_1, "Johnson 1"):
-            log("calibration: WARNING — measuring gauge 1 without confirmed arrival at POS 5", "WARN")
-        _step("Vibration damping 0.5s")
-        time.sleep(0.5)
-        _step("Measuring gauge 1")
-        res1 = _measure("gauge 1")
-        _publish(g1_raw_mm=res1.get("raw_median_mm"), g1_std_um=res1.get("std_um"), phase="g1_done")
+        _step("M6 -> Pos2 (sweep start)")
+        if not _go_and_wait(POS_STAGE, "Pos2 start"):
+            log("calibration: WARNING — starting sweep without confirmed arrival at POS 2", "WARN")
 
-        # --- Gauge 2 @ POS 6: move, vibration-damp, sample (same envelope) ---
-        _publish(phase="measuring_g2")
-        _step("M6 -> Pos6 (Johnson 2)")
-        if not _go_and_wait(POS_GAUGE_2, "Johnson 2"):
-            log("calibration: WARNING — measuring gauge 2 without confirmed arrival at POS 6", "WARN")
-        _step("Vibration damping 0.5s")
-        time.sleep(0.5)
-        _step("Measuring gauge 2")
-        res2 = _measure("gauge 2")
-        _publish(g2_raw_mm=res2.get("raw_median_mm"), g2_std_um=res2.get("std_um"), phase="computing")
+        # --- Begin capture, then run the continuous Pos2 -> Pos3 move over both gauges ---
+        # Motion speed is defined on the HMI for this target; we only command it and
+        # capture the whole stream (air + both gauges) until Pos3 arrival.
+        _step("Continuous sweep Pos2 -> Pos3")
+        tm.begin_calibration_sweep()
+        arrived_end = _go_and_wait(POS_END, "Pos3 end")
+        sweep = tm.finish_calibration_sweep()
+        if not arrived_end:
+            log("calibration: WARNING — Pos3 arrival not confirmed; segmenting captured sweep as-is", "WARN")
+        log(f"calibration: sweep ok={sweep.get('ok')} reason='{sweep.get('reason')}' "
+            f"n={sweep.get('n')} plateaus={sweep.get('plateaus')}", "INFO")
+
+        # Publish per-gauge trimmed-mean raw sums (std is informational only now).
+        _publish(g1_raw_mm=sweep.get("raw_g1_mm"), g1_std_um=sweep.get("g1_std_um"), phase="g1_done")
+        _publish(g2_raw_mm=sweep.get("raw_g2_mm"), g2_std_um=sweep.get("g2_std_um"), phase="computing")
 
         # --- Save + compute the two-point linearization, then decide success/fail ---
         _step("Computing two-point fit")
-        ok, info = tm.compute_and_apply_calibration(res1.get("raw_median_mm"), res2.get("raw_median_mm"))
+        if not sweep.get("ok"):
+            # Segmentation could not isolate exactly two gauge plateaus -> do not fit.
+            ok, info = False, {"reason": sweep.get("reason", "sweep segmentation failed")}
+        else:
+            ok, info = tm.compute_and_apply_calibration(sweep.get("raw_g1_mm"), sweep.get("raw_g2_mm"))
         if ok:
             _publish(phase="done_ok", a=info["a"], b_um=info["b"] * 1000.0, message="",
                      step_text="Calibration OK")
@@ -865,8 +870,12 @@ def run_calibration_sequence():
             # A failed calibration must NOT leave the previous calibration in effect —
             # invalidate it so the machine produces no measurements until a valid one.
             tm.invalidate_calibration()
-            extra = (f" [g1 n={res1.get('n')} std={res1.get('std_um')} | "
-                     f"g2 n={res2.get('n')} std={res2.get('std_um')}]")
+            _plats = sweep.get("plateaus", []) or []
+            _n1 = _plats[0].get("n") if len(_plats) > 0 else 0
+            _n2 = _plats[1].get("n") if len(_plats) > 1 else 0
+            extra = (f" [sweep n={sweep.get('n')} plateaus={len(_plats)} | "
+                     f"g1 n={_n1} std={sweep.get('g1_std_um')} | "
+                     f"g2 n={_n2} std={sweep.get('g2_std_um')}]")
             _publish(phase="done_fail", message=(info.get("reason", "") + extra),
                      step_text="Calibration FAIL")
             log(f"calibration FAIL (calibration invalidated): {info.get('reason')}{extra}", "WARN")
