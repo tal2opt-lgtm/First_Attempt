@@ -1,5 +1,4 @@
 
-import json
 import os
 import time
 import tkinter as tk
@@ -12,17 +11,18 @@ STALE_SEC = 1.0         # אם אין דגימות חדשות מעבר לזה - 
 
 class SimpleThicknessDisplay:
     def __init__(self):
-        # --- מנוע המדידה: נשענים על thck.Cfg (נטען אוטומטית בייבוא המודול) ---
-        self.state = thck.ThicknessRuntimeState()
+        # --- מנוע המדידה: בונים קונפיג מפורשות מאותו קובץ שהמנוע הראשי משתמש בו ---
+        # (במודול הלינאריזציה אין Cfg גלובלי, וה-state/החיישנים דורשים cfg)
+        cfg_path = os.path.join(os.path.dirname(thck.__file__),
+                                "config", "config457_thk.json")
+        self.cfg = thck.ThicknessConfig(thck.load_config_json(cfg_path))
+        self.state = thck.ThicknessRuntimeState(self.cfg)
         self.readers = [
-            thck.SensorReader(self.state, name, info["port"])
-            for name, info in thck.Cfg.SENSORS.items()
+            thck.SensorReader(self.cfg, self.state, name, info["port"])
+            for name, info in self.cfg.SENSORS.items()
         ]
         self._last_change = 0.0
         self._last_ts_seen = {"TOP": 0.0, "BOTTOM": 0.0}
-
-        # --- מקדמי הלינאריזציה a,b (נשאבים מאותו קובץ קונפיג של המנוע) ---
-        self.cal_a, self.cal_b = self._load_calibration()
 
         # --- UI: חלון עם מלבן גדול וערך במרכזו ---
         self.root = tk.Tk()
@@ -64,19 +64,6 @@ class SimpleThicknessDisplay:
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-    # --- שליפת מקדמי הלינאריזציה a,b מבלוק calibration שבקובץ הקונפיג ---
-    # thickness_corrected = a * thickness_raw + b
-    # אם אין בלוק calibration (או שגיאה) - ברירת מחדל a=1,b=0, כלומר זהה לחישוב הגולמי.
-    def _load_calibration(self):
-        try:
-            cfg_path = os.path.join(os.path.dirname(thck.__file__),
-                                    "config", "config457_thk.json")
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cal = json.load(f).get("calibration") or {}
-            return float(cal.get("a", 1.0)), float(cal.get("b", 0.0))
-        except Exception:
-            return 1.0, 0.0
-
     # --- קריאת הדגימה האחרונה מכל חיישן וחישוב עובי ---
     # מחזיר (עובי, הודעה, מרחק עליון, מרחק תחתון); מרחק None = אין נתונים מהחיישן
     def read_thickness_mm(self):
@@ -95,12 +82,15 @@ class SimpleThicknessDisplay:
 
         _, top_abs = top
         _, bot_abs = bot
-        if top_abs >= thck.Cfg.ERROR_THRESHOLD_MM or bot_abs >= thck.Cfg.ERROR_THRESHOLD_MM:
+        if top_abs >= self.cfg.ERROR_THRESHOLD_MM or bot_abs >= self.cfg.ERROR_THRESHOLD_MM:
             return None, "No part", top_abs, bot_abs
 
-        # עובי גולמי (גיאומטרי), ואז החלת הלינאריזציה a*raw + b
-        thickness_raw = thck.Cfg.SENSOR_DISTANCE_MM - (top_abs + bot_abs)
-        thickness = self.cal_a * thickness_raw + self.cal_b
+        # לינאריזציה: thickness = a*(top+bottom) + b ; a,b מגיעים מבלוק calibration בקונפיג.
+        # apply_calibration מחזיר None כשאין כיול תקף (calibration.valid=false / חסרים a,b).
+        sensors_sum_mm = top_abs + bot_abs
+        thickness = self.state.apply_calibration(sensors_sum_mm)
+        if thickness is None:
+            return None, "No Calib", top_abs, bot_abs
         return thickness, None, top_abs, bot_abs
 
     def update_display(self):
@@ -111,7 +101,7 @@ class SimpleThicknessDisplay:
             self.value_lbl.config(text=msg, fg="#aaaaaa")
 
         for name, dist in (("TOP", top_abs), ("BOTTOM", bot_abs)):
-            if dist is not None and dist < thck.Cfg.ERROR_THRESHOLD_MM:
+            if dist is not None and dist < self.cfg.ERROR_THRESHOLD_MM:
                 self.sensor_lbls[name].config(text=f"{dist:.5f}", fg="#333333")
             else:
                 self.sensor_lbls[name].config(
