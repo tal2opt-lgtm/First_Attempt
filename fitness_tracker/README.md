@@ -93,11 +93,14 @@ fitness_tracker/
 │   ├── extract.py                ← קריאה למודל הראייה (JSON)
 │   ├── append_row.py             ← הוספת שורה ל-xlsx בשמירת עיצוב/נוסחאות
 │   ├── csv_to_xlsx.py            ← מיזוג יומן ה-CSV מהאייפון לתבנית
+│   ├── xlsx_to_csv.py            ← ייצוא ההיסטוריה הקיימת ל-Runs.csv
 │   ├── cli.py                    ← הרצה מקצה לקצה
 │   ├── prompt.txt                ← פרומפט חילוץ (פלט JSON)
 │   └── prompt_line.txt           ← פרומפט חילוץ (פלט שורת CSV, לשורט-קאט)
 ├── shortcut/
-│   └── SHORTCUT_SETUP_he.md      ← מדריך בניית הקיצור באייפון
+│   ├── SHORTCUT_SETUP_he.md      ← מדריך בניית הקיצור באייפון
+│   └── request_body_template.txt ← גוף הבקשה המוכן להדבקה בשורט-קאט
+├── Runs.csv                      ← יומן הריצות (מאותחל עם 14 הריצות שלך)
 ├── template/
 │   └── fitness_master.xlsx       ← קובץ היעד (התבנית שלך)
 ├── samples/                      ← שני צילומי המסך לדוגמה
