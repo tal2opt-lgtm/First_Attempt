@@ -102,13 +102,17 @@ async function callModel(images, key, model){
 // ---- UI: העלאה -------------------------------------------------------------
 let files=[];
 $("file").addEventListener("change", e=>{
-  files=[...e.target.files].slice(0,4);
+  files=[...(e.target.files||[])].slice(0,4);
   const t=$("thumbs"); t.innerHTML="";
   files.forEach(f=>{const img=document.createElement("img"); img.src=URL.createObjectURL(f); t.appendChild(img);});
   $("extractBtn").disabled = files.length===0;
-  status("uploadStatus","");
+  if(files.length){
+    status("uploadStatus", `נבחרו ${files.length} תמונות ✓ — עכשיו לחץ "חלץ נתונים".`, "ok");
+    $("extractBtn").scrollIntoView({behavior:"smooth", block:"center"});
+  } else {
+    status("uploadStatus","");
+  }
 });
-$("dropLabel").addEventListener("click",()=>$("file").click());
 
 $("extractBtn").addEventListener("click", async ()=>{
   const key=($("apiKey").value||"").trim();
