@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ריצות">
+<meta name="theme-color" content="#2b7cff">
+<title>מעקב ריצות</title>
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  :root{
+    --bg:#0f1216; --card:#181d24; --card2:#1f2630; --line:#2b333f;
+    --txt:#e8edf3; --muted:#9aa7b5; --accent:#3ea6ff; --accent2:#7ee787;
+    --danger:#ff6b6b; --warn:#ffcf5c;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f6f9; --card:#ffffff; --card2:#eef2f7; --line:#d9e0ea;
+      --txt:#101720; --muted:#5b6875; --accent:#0a66d6; --accent2:#1a8f4a; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    -webkit-text-size-adjust:100%;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+  header{padding:18px 16px 10px;text-align:center}
+  header h1{margin:0;font-size:22px;letter-spacing:.2px}
+  header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  main{max-width:760px;margin:0 auto;padding:8px 12px 40px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:16px;margin:12px 0}
+  .card h2{margin:0 0 12px;font-size:15px;color:var(--muted);font-weight:600}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input[type=text],input[type=password],input[type=number],select{
+    width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);
+    background:var(--card2);color:var(--txt);font-size:16px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row>div{flex:1;min-width:120px}
+  button{font-size:16px;font-weight:600;border:0;border-radius:12px;padding:14px 16px;
+    cursor:pointer;transition:.15s;width:100%}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-accent{background:var(--accent2);color:#06210f}
+  .btn-ghost{background:var(--card2);color:var(--txt);border:1px solid var(--line)}
+  .btn-danger{background:transparent;color:var(--danger);border:1px solid var(--danger);padding:8px 10px;font-size:13px;width:auto}
+  button:disabled{opacity:.5}
+  .drop{border:2px dashed var(--line);border-radius:14px;padding:26px 14px;text-align:center;
+    color:var(--muted);background:var(--card2)}
+  .drop strong{color:var(--txt)}
+  .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .thumbs img{height:88px;border-radius:8px;border:1px solid var(--line)}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.6}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .fld label{margin:0 0 3px}
+  .fld input{padding:9px;font-size:15px}
+  .status{margin:10px 0;padding:10px 12px;border-radius:10px;font-size:14px;display:none}
+  .status.show{display:block}
+  .status.err{background:rgba(255,107,107,.14);color:var(--danger)}
+  .status.ok{background:rgba(126,231,135,.14);color:var(--accent2)}
+  .status.info{background:rgba(62,166,255,.14);color:var(--accent)}
+  .status.warn{background:rgba(255,207,92,.16);color:var(--warn)}
+  .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px;border:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}
+  th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:center}
+  th{background:var(--card2);color:var(--muted);position:sticky;top:0;font-weight:600}
+  tbody tr:last-child td{background:rgba(126,231,135,.10)}
+  td.del{cursor:pointer;color:var(--danger);font-weight:700}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .toolbar button{width:auto;flex:1;min-width:130px;padding:12px}
+  details summary{cursor:pointer;color:var(--muted);font-size:13px}
+  .spin{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.4);
+    border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px;margin-inline-end:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .count{color:var(--muted);font-size:13px;font-weight:400}
+  /* קלט קבצים גלוי וניתן ללחיצה — יציב יותר על iOS מאשר input מוסתר */
+  input[type=file]{width:100%;margin-top:10px;font-size:15px;color:var(--txt)}
+  input[type=file]::file-selector-button{font-size:15px;font-weight:600;border:0;border-radius:10px;
+    padding:12px 16px;background:var(--accent);color:#fff;margin-inline-end:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🏃 מעקב ריצות</h1>
+  <p>צילום מסך של Apple Fitness ← שורה חדשה בטבלה</p>
+</header>
+<main>
+
+  <!-- Step 1: upload -->
+  <div class="card">
+    <h2>1 · העלאת צילום מסך</h2>
+    <div class="drop" id="dropLabel">
+      <strong>בחר צילום/י מסך של ריצה</strong><br>
+      אפשר לבחור גם 2 מסכים יחד (Summary + Map)
+      <input id="file" type="file" accept="image/*" multiple>
+    </div>
+    <div class="thumbs" id="thumbs"></div>
+    <button class="btn-primary" id="extractBtn" style="margin-top:12px" disabled>חלץ נתונים</button>
+    <div class="status" id="uploadStatus"></div>
+  </div>
+
+  <!-- Step 2: confirm -->
+  <div class="card" id="confirmCard" style="display:none">
+    <h2>2 · אישור לפני שמירה <span class="count">(אפשר לתקן כל שדה)</span></h2>
+    <div class="grid" id="fields"></div>
+    <div class="status warn show" id="confirmNote" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:12px">
+      <div><button class="btn-accent" id="addBtn">הוסף לטבלה ⬇︎</button></div>
+      <div><button class="btn-ghost" id="cancelBtn">בטל</button></div>
+    </div>
+  </div>
+
+  <!-- Step 3: table -->
+  <div class="card">
+    <h2>3 · הטבלה שלך <span class="count" id="rowCount"></span></h2>
+    <div class="tablewrap">
+      <table id="tbl">
+        <thead><tr id="thead"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="toolbar">
+      <button class="btn-ghost" id="csvBtn">⬇︎ ייצוא CSV</button>
+      <button class="btn-ghost" id="xlsxBtn">⬇︎ ייצוא Excel</button>
+      <button class="btn-ghost" id="copyBtn">העתק כטקסט</button>
+    </div>
+    <div class="hint">ה-CSV תואם בול לתבנית שלך — אפשר לשלוח אותו כדי לקבל את קובץ ה-Excel המלא עם גיליון "תזונה".</div>
+  </div>
+
+  <!-- Settings -->
+  <div class="card">
+    <details id="settings">
+      <summary>⚙️ הגדרות (מפתח API)</summary>
+      <label for="apiKey">מפתח Anthropic API</label>
+      <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off">
+      <div class="row">
+        <div>
+          <label for="model">מודל</label>
+          <select id="model">
+            <option value="claude-sonnet-5">claude-sonnet-5 (מומלץ)</option>
+            <option value="claude-opus-5">claude-opus-5 (מדויק יותר, יקר)</option>
+          </select>
+        </div>
+        <div>
+          <label for="year">שנה (2 ספרות)</label>
+          <input id="year" type="number" min="20" max="99">
+        </div>
+      </div>
+      <div class="hint">
+        המפתח נשמר בדפדפן של המכשיר הזה בלבד ונשלח רק ל-Anthropic. אף אחד אחר לא רואה אותו.<br>
+        יצירת מפתח: console.anthropic.com ← API Keys ← Create Key.
+      </div>
+      <button class="btn-ghost" id="resetBtn" style="margin-top:12px">איפוס הטבלה לברירת המחדל (14 ריצות)</button>
+    </details>
+  </div>
+
+</main>
+
+<script src="normalize.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

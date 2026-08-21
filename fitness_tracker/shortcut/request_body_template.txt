@@ -1,0 +1,30 @@
+הדבק את הטקסט הבא לתוך פעולת "Text" בשורט-קאט (שלב 4 במדריך).
+במקומות שמסומנים ב-«...» מוחקים את הסוגריים והטקסט וגוררים פנימה את המשתנה.
+
+--- לשני צילומי מסך (Summary + Map) — הגרסה הרגילה: ---
+
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 400,
+  "messages": [
+    { "role": "user", "content": [
+      { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "«B1»" } },
+      { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "«B2»" } },
+      { "type": "text", "text": "«משתנה הפרומפט מ-prompt_line.txt»" }
+    ] }
+  ]
+}
+
+
+--- לצילום מסך אחד בלבד: ---
+
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 400,
+  "messages": [
+    { "role": "user", "content": [
+      { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "«B1»" } },
+      { "type": "text", "text": "«משתנה הפרומפט מ-prompt_line.txt»" }
+    ] }
+  ]
+}
